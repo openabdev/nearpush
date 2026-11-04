@@ -64,6 +64,9 @@ pub struct Config {
 pub const DEFAULT_SUMMARIZER_COMMAND: &[&str] =
     &["kiro-cli", "chat", "--no-interactive", "--model", "claude-haiku-5.5", "--trust-tools="];
 pub const DEFAULT_SUMMARIZER_TIMEOUT_SECS: u64 = 30;
+/// Login-keychain generic password holding the summarizer's `KIRO_API_KEY`.
+pub const DEFAULT_KEYCHAIN_SERVICE: &str = "nearpush-kiro-api-key";
+pub const DEFAULT_SECURITY_PROGRAM: &str = "/usr/bin/security";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -72,6 +75,11 @@ pub struct SummarizerConfig {
     /// argv; the prompt goes on stdin and the label is read from stdout.
     pub command: Vec<String>,
     pub timeout_secs: u64,
+    /// Keychain service whose password is passed to each run as `KIRO_API_KEY`
+    /// (only in the child's environment). Empty: no lookup.
+    pub keychain_service: String,
+    /// The `security` binary used for the lookup (tests point it at a fake).
+    pub security_program: String,
 }
 
 impl Default for SummarizerConfig {
@@ -80,6 +88,8 @@ impl Default for SummarizerConfig {
             enabled: true,
             command: DEFAULT_SUMMARIZER_COMMAND.iter().map(|s| s.to_string()).collect(),
             timeout_secs: DEFAULT_SUMMARIZER_TIMEOUT_SECS,
+            keychain_service: DEFAULT_KEYCHAIN_SERVICE.to_string(),
+            security_program: DEFAULT_SECURITY_PROGRAM.to_string(),
         }
     }
 }
@@ -242,6 +252,9 @@ mod tests {
         assert_eq!(cfg.summarizer.command.len(), 3);
         assert!(cfg.validate().is_ok());
         assert!(toml::from_str::<Config>("[summarizer]\nbogus = 1").is_err());
+        assert_eq!(Config::default().summarizer.keychain_service, "nearpush-kiro-api-key");
+        let cfg: Config = toml::from_str("[summarizer]\nkeychain_service = \"\"").unwrap();
+        assert!(cfg.summarizer.keychain_service.is_empty());
     }
 
     #[test]

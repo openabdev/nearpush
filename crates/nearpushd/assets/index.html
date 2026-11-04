@@ -88,6 +88,13 @@
   #label { font-size: clamp(15px, 4.6vmin, 28px); color: #d1d1d6; margin-top: 2px; }
   #task { font-size: clamp(17px, 5.6vmin, 36px); font-weight: 600; margin-top: 4px; }
   #detail { font-size: clamp(14px, 4.2vmin, 26px); color: var(--dim); margin-top: 2px; }
+  /* agent-state cards: subtitle wraps to 2 lines (4 in landscape) */
+  #sub { font-size: clamp(15px, 4.6vmin, 30px); color: var(--dim); line-height: 1.25; margin-top: 2px;
+         display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  #sub:empty { display: none; }
+  /* generic notifications (no agent state): the whole body wraps; the lower block scrolls if it is long */
+  #card.generic #lower { max-height: 48%; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+  #card.generic #sub { display: block; -webkit-line-clamp: unset; white-space: pre-wrap; overflow-wrap: anywhere; }
   #foot { flex: none; display: flex; align-items: baseline; gap: 12px; padding-top: 12px;
           font-size: clamp(13px, 3.6vmin, 20px); color: var(--dim); }
   #missed { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -106,6 +113,7 @@
     #headline { grid-column: 1; grid-row: 2; }
     #lower { grid-column: 2; grid-row: 2; align-self: center; padding-top: 0; }
     #foot { grid-column: 1 / 3; grid-row: 3; }
+    #sub { -webkit-line-clamp: 4; }
   }
 
   #drawer {
@@ -155,6 +163,7 @@
     <div id="proj" class="ln"></div>
     <div id="label" class="ln"></div>
     <div id="task" class="ln"></div>
+    <div id="sub"></div>
     <div id="detail" class="ln"></div>
   </div>
   <div id="foot">
@@ -435,6 +444,7 @@
     head.textContent = '';
     head.className = s.wrap ? 'wrap' : '';
     card.classList.toggle('working', s.state === 'working');
+    card.classList.toggle('generic', !!e && !s.state);
     s.lines.forEach(([text, color], i) => {
       const line = document.createElement('span');
       line.className = `line c-${color}`;
@@ -455,7 +465,8 @@
     $('proj').textContent = e ? [e.project, e.host].filter(Boolean).join(' · ') : '';
     $('label').textContent = (e && e.session_label) || '';
     $('task').textContent = taskLine(e, s);
-    $('detail').textContent = (e && e.detail) || s.sub;
+    $('sub').textContent = s.sub;
+    $('detail').textContent = (e && e.detail) || '';
     $('when').textContent = e ? clock(e.ts) : '';
     document.body.classList.toggle('pinned', pinnedId != null);
     card.classList.toggle('link', !!(e && safeUrl(e.url)));

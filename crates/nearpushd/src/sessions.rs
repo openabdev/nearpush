@@ -25,6 +25,10 @@ pub const MAX_STORED_PROMPT_CHARS: usize = 500;
 pub const MAX_HELLO_LABELS: usize = 50;
 /// Summarize again after this many prompts.
 pub const RESUMMARIZE_EVERY: u32 = 5;
+/// Wait after the first failed summarizer run of a session; doubles per failure.
+pub const BACKOFF_BASE_MS: u64 = 60_000;
+/// Longest wait between failed runs of a session.
+pub const BACKOFF_MAX_MS: u64 = 3_600_000;
 
 /// Broadcast when the summarizer produced a new label for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -44,6 +48,20 @@ struct Entry {
     label: Option<String>,
     #[serde(default)]
     updated: u64,
+    /// Consecutive failed summarizer runs.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    failures: u32,
+    /// No summarizer run before this time (ms) after a failure.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    retry_after: u64,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 pub struct Sessions {
@@ -120,7 +138,9 @@ impl Sessions {
     }
 
     /// Records a prompt. Returns true when the summarizer should run: the first
-    /// prompt, every [`RESUMMARIZE_EVERY`] prompts, or a clear topic change.
+    /// prompt, every [`RESUMMARIZE_EVERY`] prompts, a clear topic change, or while
+    /// the session has no label yet. After a failed run nothing is requested until
+    /// the session's backoff (see [`Sessions::note_failure`]) has passed.
     pub fn record_prompt(&self, session: &str, prompt: &str, now: u64) -> bool {
         let prompt = cap_chars(prompt.trim(), MAX_STORED_PROMPT_CHARS);
         if prompt.is_empty() {
@@ -131,7 +151,7 @@ impl Sessions {
             None => {
                 inner.insert(
                     session.to_string(),
-                    Entry { first: prompt, recent: VecDeque::new(), count: 1, label: None, updated: now },
+                    Entry { first: prompt, count: 1, updated: now, ..Entry::default() },
                 );
                 true
             }
@@ -143,7 +163,7 @@ impl Sessions {
                     e.recent.pop_front();
                 }
                 e.recent.push_back(prompt);
-                changed || e.count % RESUMMARIZE_EVERY == 0 || e.label.is_none()
+                (changed || e.count % RESUMMARIZE_EVERY == 0 || e.label.is_none()) && now >= e.retry_after
             }
         };
         if inner.len() > MAX_SESSIONS {
@@ -176,11 +196,29 @@ impl Sessions {
         Some(s)
     }
 
-    /// Stores a new label; returns false if it equals the current one.
+    /// Records a failed summarizer run: the session waits [`BACKOFF_BASE_MS`],
+    /// doubling per consecutive failure up to [`BACKOFF_MAX_MS`], before the next one.
+    pub fn note_failure(&self, session: &str, now: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(e) = inner.get_mut(session) else { return };
+        e.failures = e.failures.saturating_add(1);
+        let wait = BACKOFF_BASE_MS.saturating_mul(1u64 << (e.failures - 1).min(16)).min(BACKOFF_MAX_MS);
+        e.retry_after = now.saturating_add(wait);
+        self.save_locked(&inner);
+    }
+
+    /// Stores a new label and clears any failure backoff; returns false if the
+    /// label equals the current one.
     pub fn set_label(&self, session: &str, label: &str, now: u64) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(e) = inner.get_mut(session) else { return false };
+        let had_backoff = e.failures != 0;
+        e.failures = 0;
+        e.retry_after = 0;
         if e.label.as_deref() == Some(label) {
+            if had_backoff {
+                self.save_locked(&inner);
+            }
             return false;
         }
         e.label = Some(label.to_string());
@@ -223,6 +261,29 @@ mod tests {
         assert!(s.record_prompt("a", "ok", 5), "fifth prompt");
         assert!(s.record_prompt("a", "幫我把相簿匯出成 PDF 並寄給客戶", 6), "topic change");
         assert!(s.record_prompt("b", "another session", 7), "first prompt of b");
+    }
+
+    #[test]
+    fn failed_runs_back_off() {
+        let s = Sessions::in_memory();
+        assert!(s.record_prompt("a", "fix the login redirect bug in the auth service", 1_000));
+        s.note_failure("a", 2_000);
+        // No label yet, but inside the backoff window: no new run, even on a topic change.
+        assert!(!s.record_prompt("a", "still looping", 3_000));
+        assert!(!s.record_prompt("a", "幫我把相簿匯出成 PDF 並寄給客戶", 4_000));
+        assert!(s.record_prompt("a", "again", 2_000 + BACKOFF_BASE_MS), "window passed");
+        s.note_failure("a", 100_000);
+        assert!(!s.record_prompt("a", "again", 100_000 + BACKOFF_BASE_MS), "second failure doubles");
+        assert!(s.record_prompt("a", "again", 100_000 + 2 * BACKOFF_BASE_MS));
+        for _ in 0..30 {
+            s.note_failure("a", 0);
+        }
+        assert!(!s.record_prompt("a", "again", BACKOFF_MAX_MS - 1));
+        assert!(s.record_prompt("a", "again", BACKOFF_MAX_MS), "capped");
+        // Success clears the backoff.
+        s.note_failure("a", 10_000_000);
+        assert!(s.set_label("a", "Fix login redirect", 10_000_001));
+        assert_eq!(s.inner.lock().unwrap()["a"].retry_after, 0);
     }
 
     #[test]

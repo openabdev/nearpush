@@ -379,6 +379,8 @@ fn summarizer_state(dir: &Path, script: &str, timeout_secs: u64) -> AppState {
         enabled: true,
         command: vec!["/bin/sh".into(), "-c".into(), script.into()],
         timeout_secs,
+        keychain_service: String::new(),
+        ..SummarizerConfig::default()
     };
     state(dir, true)
         .with_sessions(nearpushd::sessions::Sessions::load(dir))
@@ -448,4 +450,35 @@ async fn failing_or_slow_summarizer_keeps_provisional_label() {
         assert_eq!(f["event"]["session_label"], "prov", "{script}");
         d.stop().await;
     }
+}
+
+#[tokio::test]
+async fn prompts_are_not_kept_when_summarizer_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start_with(state(dir.path(), true).with_sessions(nearpushd::sessions::Sessions::load(dir.path()))).await;
+    let r = push(&d, json!({ "title": "working.", "state": "working", "session": "s1", "session_label": "prov",
+        "prompt": "secret prompt text" })).await;
+    assert_eq!(r.status(), 200);
+    d.stop().await;
+    let sessions = std::fs::read_to_string(dir.path().join("sessions.json")).unwrap_or_default();
+    assert!(!sessions.contains("secret prompt text"), "{sessions}");
+    let log = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+    assert!(!log.contains("secret prompt text"));
+}
+
+#[tokio::test]
+async fn failing_summarizer_is_not_rerun_on_every_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = dir.path().join("runs");
+    let script = format!("cat >/dev/null; echo run >> '{}'; exit 1", runs.display());
+    let d = Daemon::start_with(summarizer_state(dir.path(), &script, 5)).await;
+    for i in 0..4 {
+        push(&d, json!({ "title": "working.", "state": "working", "session": "s1", "session_label": "prov",
+            "prompt": format!("fix the login redirect, try {i}") })).await;
+        // Past the worker's debounce, so each prompt would be its own run.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+    d.stop().await;
+    let n = std::fs::read_to_string(&runs).unwrap_or_default().lines().count();
+    assert_eq!(n, 1, "one failed run, then backoff");
 }

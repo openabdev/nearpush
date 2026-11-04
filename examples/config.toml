@@ -5,8 +5,13 @@ buffer_size = 500
 allow_loopback_without_login = false
 
 [summarizer]
+# Each run is a kiro-cli call billed to your Kiro account that sends the session's
+# stored prompts to Kiro's model service. false: no runs and no prompts kept.
 enabled = true
 # The prompts go on stdin, the label is read from stdout. Runs in
 # ~/.local/state/nearpush/summarizer/ with NEARPUSH_DISABLE=1 set.
 command = ["kiro-cli", "chat", "--no-interactive", "--model", "claude-haiku-5.5", "--trust-tools="]
 timeout_secs = 30
+# KIRO_API_KEY for each run, read from the login keychain with
+# /usr/bin/security find-generic-password -s <service> -w. "" disables the lookup.
+keychain_service = "nearpush-kiro-api-key"

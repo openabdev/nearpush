@@ -213,8 +213,9 @@ async fn push(
     let new: NewEvent = serde_json::from_slice(&body)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid payload: {e}")))?;
     let mut new = new.validate(now_ms()).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
-    // The prompt only feeds the summarizer; it is never stored with the event.
-    let prompt = new.prompt.take();
+    // The prompt only feeds the summarizer; it is never stored with the event, and
+    // it is not recorded at all when the summarizer is off.
+    let prompt = new.prompt.take().filter(|_| state.summarizer.is_some());
     let session = new.session.clone();
     if let Some(label) = session.as_deref().and_then(|s| state.sessions.label(s)) {
         // A summarized label replaces the hook's provisional one.

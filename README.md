@@ -73,6 +73,7 @@ allow_loopback_without_login = false  # local testing: let header-less loopback 
 enabled = true
 command = ["kiro-cli", "chat", "--no-interactive", "--model", "claude-haiku-5.5", "--trust-tools="]
 timeout_secs = 30
+keychain_service = "nearpush-kiro-api-key"  # KIRO_API_KEY for each run; "" = no lookup
 ```
 
 The broadcast channel per viewer is never larger than `buffer_size`, so a viewer that
@@ -103,12 +104,33 @@ installed does not report itself. A new label is broadcast as a `session_update`
 the page updates that session's cards in place, and later events of the session carry
 the label. If the summarizer is missing, fails or times out, the hook's provisional
 label (the first prompt, truncated to 40 characters) stays and a warning is logged.
+After a failed run the session gets no new run for 1 minute, doubling per consecutive
+failure up to 1 hour, so a logged-out kiro-cli does not start a process on every prompt.
 
-The default kiro-cli command needs a login that the LaunchAgent can see. A `KIRO_API_KEY`
-exported in an interactive shell (or injected by a running Kiro session) is not in
-launchd's environment, so `kiro-cli chat` from nearpushd answers "Not logged in" until
-`kiro-cli login` has been run on the laptop (`kiro-cli whoami`, run without
-`KIRO_API_KEY` set, shows whether it has).
+**Cost and data flow.** The summarizer is on by default. Each run is one
+`kiro-cli chat` call on `claude-haiku-5.5` (0.06x credits) billed to the Kiro account
+kiro-cli is logged in with, and it sends that session's stored prompts (first + last
+four, 500 characters each) to Kiro's model service. Expect about one run per session
+plus one per five prompts or topic change. Set `[summarizer] enabled = false` to stop
+this: the daemon then keeps no prompts at all (nothing is written to `sessions.json`)
+and the cards show the hook's provisional label.
+
+The LaunchAgent's environment has no `KIRO_API_KEY`, so before each run nearpushd reads
+it from the login keychain with
+`/usr/bin/security find-generic-password -s nearpush-kiro-api-key -w` and sets it only
+in that run's environment. Only exit status 0 counts (a missing item exits 44); the
+trailing newline is trimmed, the key is never logged, written to state or put on argv,
+and it is replaced by `[redacted]` in the stderr excerpt of a failed run. Without a key
+the run is skipped (with the same backoff) and the provisional label stays. Store the
+key once:
+
+```sh
+security add-generic-password -a "$USER" -s nearpush-kiro-api-key -T /usr/bin/security -w
+```
+
+`[summarizer] keychain_service = ""` turns the lookup off (the command then has to find
+its own login, e.g. `kiro-cli login`); `security_program` (default `/usr/bin/security`)
+exists for tests.
 
 ## Run
 
@@ -228,6 +250,10 @@ the `hooks` array of an agent profile in `~/.kiro/agents/<agent>.json`:
   { "name": "nearpush-end",    "trigger": "SessionEnd",       "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 }
 ]
 ```
+
+With the default config, the prompts of every hooked session also go to the session
+summarizer, an LLM call billed to your Kiro account (see [Session labels](#session-labels)
+for the data flow and how to turn it off).
 
 Replace `~` with your home directory if your shell setup does not expand it. To cover
 every agent instead, put the same four entries in a standalone hook file,
