@@ -67,6 +67,7 @@ struct MenuContent: View {
             if let reason = model.supervisor.reason {
                 Text("    " + reason)
             }
+            Text("Launch at Login: SMAppService.mainApp \(model.loginStatus.label)")
             if case .empty = model.serve {
                 Button("Set up tailscale serve") { model.setUpServe() }
             }
@@ -78,5 +79,17 @@ struct MenuContent: View {
         Button("Open logs") { model.openLogs() }
         Button("Quit Nearpush") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+}
+
+extension SMAppService.Status {
+    var label: String {
+        switch self {
+        case .enabled: return "enabled"
+        case .requiresApproval: return "requires approval"
+        case .notRegistered: return "not registered"
+        case .notFound: return "not found"
+        @unknown default: return "unknown (\(rawValue))"
+        }
     }
 }

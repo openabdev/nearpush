@@ -68,6 +68,7 @@ final class AppModel: ObservableObject {
         started = true
         Task {
             await supervisor.start()
+            await poll() // so the first diagnostics see a real status, not nil
             await refreshDiagnostics()
             var lastDiag = Date()
             while true {
