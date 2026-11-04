@@ -2,10 +2,6 @@
 
 How Kiro CLI sessions drive the iPhone desk display.
 
-> Status: the `working` filter, the Stop classifier (`your_turn` vs `all_set`), the
-> workflow-step skip rule and the workflow count are built. The menu bar app is built but
-> not yet installed; the section marked *(planned)* describes it until it is.
-
 ## Architecture
 
 ```mermaid
@@ -31,7 +27,11 @@ flowchart LR
   viewers, and asks the summarizer for a per-session purpose label in the background.
 - **Tailscale** (`tailscale serve`) exposes HTTPS to the tailnet only. Requests that arrive
   through it may view (`/`, `/ws`) but are refused on `/push`, `/status` and `/control`.
-- **Menu bar app** *(planned)* talks to nearpushd over loopback `/status` and `/control`.
+- **Menu bar app** (`~/Applications/Nearpush.app`) bundles nearpushd and keeps it running
+  as the launchd agent `dev.nearpush.agent` (registered with `SMAppService.agent`; it
+  survives quitting the menu and launchd restarts it after a crash). It polls loopback
+  `GET /status` every 3 s for the icon, status line and recent events, and uses
+  `POST /control` for Pause and the "Show on iPhone" state checkboxes.
 
 ## One turn
 
@@ -105,7 +105,10 @@ sequenceDiagram
 
 ## Install
 
-Global hook file, which applies to every agent and workspace: `~/.kiro/hooks/nearpush.json`.
+1. Install `~/Applications/Nearpush.app` and the matching `~/.local/bin/nearpush` (see
+   the README's *Menu bar app* section), and open the app once. It starts nearpushd.
+2. Add the global hook file, which applies to every agent and workspace:
+   `~/.kiro/hooks/nearpush.json`.
 
 ```json
 {

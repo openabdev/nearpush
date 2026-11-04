@@ -33,7 +33,10 @@ nearpush send ──HTTP+token──▶ nearpushd 127.0.0.1:8787 ◀── tails
 - `crates/nearpushd`: the daemon (axum + tokio). The web page, manifest and icons live
   in `crates/nearpushd/assets/` and are compiled into the binary.
 - `crates/nearpush`: the CLI (clap + reqwest/rustls).
+- `macos/`: the menu bar app (SwiftPM; `NearpushCore` library + `Nearpush` executable).
+  `scripts/build-app.sh` bundles it with nearpushd into `Nearpush.app`.
 - `tools/gen_icons.py`: regenerates the PNG icons (standard-library Python).
+- [`docs/kiro.md`](docs/kiro.md): how Kiro sessions drive the display, with diagrams.
 
 ## Build
 
@@ -55,6 +58,8 @@ scp macmini:~/repo/nearpush/target/release/{nearpushd,nearpush} ~/.local/bin/
 | `~/.local/state/nearpush/events.jsonl` | one JSON event per line, reloaded on start (0600) |
 | `~/.local/state/nearpush/sessions.json` | per-session prompt history (capped) and summarized labels (0600) |
 | `~/.local/state/nearpush/hooks/*.json` | `nearpush hook` per-session state (0600) |
+| `~/.local/state/nearpush/control.json` | runtime pause and filter set through `POST /control` (0600) |
+| `~/Library/Logs/nearpush/nearpushd.log` | daemon log when started by the menu bar app (`--log-file`, 0600) |
 | `~/.config/nearpush/icons/<sender>.{svg,png}` | optional icon overrides |
 
 The state directory is forced to 0700 and its files to 0600 on every start.
@@ -68,6 +73,13 @@ listen = "127.0.0.1:8787"        # must be loopback; nearpushd refuses anything 
 allowed_logins = ["you@example.com"]  # Tailscale-User-Login values allowed to view
 buffer_size = 500                # events kept in memory for replay (1..=10000)
 allow_loopback_without_login = false  # local testing: let header-less loopback requests view
+public_url = "https://laptop.tailnet.ts.net/"  # shown in /status; unset: from tailscale status
+
+[filter]                         # which agent states the page shows
+states = ["all_set", "your_turn", "allow"]   # default; add "working" to see turn starts
+
+[hook]                           # read by `nearpush hook` only
+include_subagents = false        # true: workflow-step / sub-agent sessions push too
 
 [summarizer]                     # LLM that labels each Kiro session with its purpose
 enabled = true
@@ -75,6 +87,17 @@ command = ["kiro-cli", "chat", "--no-interactive", "--model", "claude-haiku-5.5"
 timeout_secs = 30
 keychain_service = "nearpush-kiro-api-key"  # KIRO_API_KEY for each run; "" = no lookup
 ```
+
+**Display filter.** An event is shown when it is not muted (see pause below) and either
+has no `state` (generic `nearpush send` events always show) or has a state listed in
+`[filter] states`. Hidden events are stored in `events.jsonl` and listed in
+`GET /status` with `"shown": false`, but they are never broadcast or replayed, so
+neither the main card nor the history drawer shows them. `POST /control {"states": [...]}`
+changes the list at runtime and applies to open sockets at once; the override is kept in
+`~/.local/state/nearpush/control.json` (0600) and from then on wins over `[filter]` in
+config.toml (delete `control.json` and restart to go back to the config value). The
+`[filter]` and `[hook]` sections need the nearpushd from this version: the older
+daemon rejects unknown config keys.
 
 The broadcast channel per viewer is never larger than `buffer_size`, so a viewer that
 falls behind can normally resync from the buffer. When it cannot, or when a reconnecting
@@ -134,7 +157,72 @@ exists for tests.
 
 ## Run
 
-### LaunchAgent
+### Menu bar app (recommended)
+
+`Nearpush.app` is a SwiftUI `MenuBarExtra` (no Dock icon, macOS 14+) that bundles
+nearpushd at `Contents/MacOS/nearpushd` and keeps it running. Build it on macmini and
+install it on the laptop:
+
+```sh
+rsync -a --delete --exclude target/ --exclude .build/ --exclude .agents/ --exclude .git/ --exclude build/ ./ macmini:~/repo/nearpush/
+ssh macmini 'cd ~/repo/nearpush && export PATH=$HOME/.cargo/bin:$PATH && scripts/build-app.sh'
+scp macmini:~/repo/nearpush/build/Nearpush.zip /tmp/ && ditto -x -k /tmp/Nearpush.zip ~/Applications/
+scp macmini:~/repo/nearpush/build/nearpush ~/.local/bin/nearpush   # the matching CLI
+open ~/Applications/Nearpush.app
+```
+
+`scripts/build-app.sh` runs `cargo build --release`, `swift build -c release`, assembles
+`build/Nearpush.app`, signs it ad hoc (`SIGN_ID` overrides the identity) and zips it.
+It refuses to run on any host but the build host.
+
+**Daemon lifecycle.** The app registers the bundled daemon as a launchd agent with
+`SMAppService.agent` (`Contents/Library/LaunchAgents/dev.nearpush.agent.plist`, label
+`dev.nearpush.agent`, `KeepAlive {SuccessfulExit = false}`). This works with the ad-hoc
+signature on macOS 26 and is the mode in use on the laptop. The daemon keeps running when
+the menu is quit, and launchd restarts it after a crash. If registration fails, the app
+unregisters, remembers `daemonMode = child` with the reason (shown under Diagnostics) and
+runs nearpushd as a child process, restarted with a 1 s to 30 s backoff; Quit then stops
+it. `defaults write dev.nearpush.app daemonMode agent|child` forces a mode.
+
+Before starting anything the app probes 127.0.0.1:8787. If another nearpushd answers (an
+older one without `/status`, or one at a different path), the menu says so and the app
+starts nothing. nearpushd itself exits 0 when the port is taken, so launchd never
+crash-loops against another daemon.
+
+**Menu.** Status line (running or paused, iPhone count, latest event); *iPhone URL* with
+a QR code window and Copy URL; the last 5 events (click to copy; filtered ones are marked
+"(hidden)"); *Pause pushes*; *Show on iPhone* (one checkbox per state, applied live via
+`/control`); *Summarizer* (edits `[summarizer] enabled` in config.toml and restarts the
+daemon); *Launch at Login* (`SMAppService.mainApp`); *Diagnostics* (daemon reachable,
+token file, `tailscale serve` maps to 8787, Keychain item present, by exit status only,
+the daemon mode and the login-item status; *Set up tailscale serve* appears only when
+there is no serve config at all); Restart daemon; Open logs; Quit.
+
+Logs: `~/Library/Logs/nearpush/nearpushd.log` (0600, rotated to `.1` past 10 MiB at
+start). The app reads the token from `~/.config/nearpush/token`.
+
+`~/.local/bin/nearpushd` is not used by the app. It is left in place as the rollback
+binary for the hand-written LaunchAgent below.
+
+### Rollback to the hand-written LaunchAgent
+
+1. In the menu, turn off *Launch at Login*, then Quit Nearpush.
+2. Stop the bundled agent: `launchctl bootout gui/$(id -u)/dev.nearpush.agent`. To
+   remove its registration for good, delete `~/Applications/Nearpush.app` (or toggle
+   it off in System Settings › General › Login Items & Extensions).
+3. Check that nothing holds the port: `pgrep -fl nearpushd` prints nothing.
+4. `mv ~/Library/LaunchAgents/dev.nearpush.daemon.plist.bak-menubar ~/Library/LaunchAgents/dev.nearpush.daemon.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.nearpush.daemon.plist`
+5. `mv ~/.local/bin/nearpush.bak-menubar ~/.local/bin/nearpush`. The old daemon rejects
+   the new CLI's `workflows_running`/`workflows_waiting` fields, so the two go back together.
+6. Remove `[filter]`, `[hook]` and `public_url` from `~/.config/nearpush/config.toml` if
+   you added them; the old daemon refuses to start with unknown keys.
+7. `~/.local/state/nearpush/control.json` can stay (the old daemon ignores it). Events
+   stored while paused carry `"muted": true`; the old daemon still loads them (its
+   `Event` accepts unknown fields) but will replay them like any other event.
+
+### LaunchAgent (without the app)
+
+Use this or the menu bar app, not both: only one nearpushd can own 8787.
 
 `deploy/install-launchagent.sh` renders `deploy/dev.nearpush.daemon.plist.in` into
 `~/Library/LaunchAgents/dev.nearpush.daemon.plist` (replacing `@HOME@`), creates the log
@@ -223,11 +311,40 @@ read from `.git/HEAD`), the session id, the label, the host and a detail line:
 
 | Kiro event | Card |
 |------------|------|
-| `UserPromptSubmit` | `working.`; starts the turn timer and sends the prompt to the summarizer |
-| `PreToolUse` | `working.` with `tool: summary`, e.g. `execute_bash: cargo test` (the same tool is re-sent at most every 5 s) |
-| `Stop` | `all set.` with `took Xm` |
+| `UserPromptSubmit` | `working.` (hidden by the default filter); starts the turn timer and sends the prompt to the summarizer |
+| `PreToolUse` | `working.` with `tool: summary`, e.g. `execute_bash: cargo test` (the same tool is re-sent at most every 5 s); optional, see below |
+| `Stop` | `your turn.` with the question line when the reply waits on you, else `all set.` with `took Xm` |
 | `SessionStart`, `PostToolUse` | nothing |
 | `SessionEnd` | removes the session's state file |
+
+**Stop: `your turn.` vs `all set.`** Kiro's Stop input carries only `hook_event_name`,
+`cwd` and `session_id`, no reply text ([hook docs](https://kiro.dev/docs/hooks/types/),
+[Kiro#6258](https://github.com/kirodotdev/Kiro/issues/6258)). The hook reads the reply
+from the transcript Kiro CLI writes before the hook runs,
+`~/.kiro/sessions/<workspace-hash>/<session_id>/messages.jsonl`: the last `assistant`
+record with `operationType: "Say"` after the latest `turn_start`, from the file's last
+512 KiB. A `response`, `assistant_response` or `last_assistant_message` string on stdin
+wins if Kiro adds one. A fast local heuristic, run on the last 8 lines outside code
+blocks, picks `your turn.` when the last line ends with `?`/`？`; when two or more
+numbered or lettered options follow an intro line that ends with `?`, or with `:` and a
+choice word (option, choose, pick, which, 選, 方案, 哪); or when one of the last 3 lines
+contains a phrase such as 請選, 要不要, 你決定, 跟我說, 告訴我, 是否要, 可以嗎, 好嗎,
+選哪, 哪一個, "which option", "should I", "let me know", "your call", "do you want",
+"would you like", "shall I", "want me to", "please confirm". The question line
+(redacted, at most 80 characters) becomes the detail. The card is sent at once; no model
+is asked. Without text the card is `all set.`.
+
+**Workflow runs.** The hook counts this session's workflow runs from
+`~/.kiro/sessions/<hash>/workflows/wf_*/workflow-state.json` (`parentSessionId` = the
+session): `running` while `run.beat` was touched in the last 120 s, `paused` (waiting on
+you) when the state changed in the last 24 h. The counts go on the card
+(`workflows_running` / `workflows_waiting`, page footer `1 wf running · 1 wf waiting`);
+a waiting run also turns an `all set.` into `your turn.` with detail `N wf waiting`.
+
+**Sub-agent sessions.** Workflow-step sessions fire global hooks too. The hook skips a
+session whose `session.json` has a `rootConversationId` other than its own id, a
+`_meta.kiro.workflow` object or a `_meta.kiro.serverSession.ownerSessionId`, so only the
+session you talk to notifies. `[hook] include_subagents = true` turns the skip off.
 
 It never shows `allow.`: the hook input carries no approval information (see below). The
 tool summary uses only `command`, `path`/`file_path`, `url`, `query` or `pattern`, keeps
@@ -244,11 +361,17 @@ the `hooks` array of an agent profile in `~/.kiro/agents/<agent>.json`:
 
 ```json
 "hooks": [
-  { "name": "nearpush-prompt", "trigger": "UserPromptSubmit", "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 },
-  { "name": "nearpush-tool",   "trigger": "PreToolUse",       "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 },
-  { "name": "nearpush-stop",   "trigger": "Stop",             "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 },
-  { "name": "nearpush-end",    "trigger": "SessionEnd",       "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 }
+  { "name": "nearpush-prompt", "trigger": "UserPromptSubmit", "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout_ms": 3000 },
+  { "name": "nearpush-stop",   "trigger": "Stop",             "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout_ms": 3000 },
+  { "name": "nearpush-end",    "trigger": "SessionEnd",       "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout_ms": 3000 }
 ]
+```
+
+Optional: `PreToolUse` only produces `working.` cards, so add it only when `working` is
+in `[filter] states`:
+
+```json
+  { "name": "nearpush-tool",   "trigger": "PreToolUse",       "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout_ms": 3000 }
 ```
 
 With the default config, the prompts of every hooked session also go to the session
@@ -256,10 +379,11 @@ summarizer, an LLM call billed to your Kiro account (see [Session labels](#sessi
 for the data flow and how to turn it off).
 
 Replace `~` with your home directory if your shell setup does not expand it. To cover
-every agent instead, put the same four entries in a standalone hook file,
+every agent instead, put the same entries in a standalone hook file,
 `~/.kiro/hooks/nearpush.json`, as `{ "version": "v1", "hooks": [ ... ] }` (CLI V3 loads
 global hook files for every workspace). Use one of the two placements, not both, or each
-event is pushed twice.
+event is pushed twice. [`docs/kiro.md`](docs/kiro.md) walks through one turn with
+diagrams.
 
 ### Why there is no `allow.` from hooks
 
@@ -269,9 +393,9 @@ prompts depends on rules from several scopes (Kiro's built-in asks, managed poli
 `~/.kiro/settings/permissions.yaml`, the workspace, the agent's `permissions`, approvals
 given earlier in the session, and the `approve-for-me` classifier), so the hook cannot
 reproduce the decision. Kiro also has no hook for "waiting for approval" or "waiting for
-input": `Stop` (the turn finished) is the only moment the agent waits for the user, and
-it maps to `all set.`. Use `nearpush send --state allow` or `--state your_turn` by hand
-or from another tool.
+input": `Stop` (the turn finished) is the only moment the agent waits for the user. The
+hook maps it to `your turn.` when the final reply asks something and to `all set.`
+otherwise (see above). Use `nearpush send --state allow` by hand or from another tool.
 
 ## HTTP API
 
@@ -281,6 +405,18 @@ or from another tool.
   `Tailscale-*`, `X-Forwarded-For`, `X-Forwarded-Host` or `Forwarded` header is refused
   with 403, so nothing coming through `tailscale serve` can push. Bodies over 16 KiB get 413;
   unknown fields or values that break a limit get 400. Returns `{"id":N,"ts":ms}`.
+- `GET /status`: same checks as `/push` (loopback peer, bearer token, no proxy headers;
+  through `tailscale serve` it is 403). Returns `version`, `ui_version`, `pid`, `exe`,
+  `started_at_ms`, `uptime_secs`, `viewers` (open WebSockets), `last_event_id`,
+  `paused`, `filter` (`states`, `source`: `config` or `control`), `summarizer`
+  (`enabled`, `healthy`, `last_ok_ms`, `last_error_ms`), `public_url` and `recent` (the
+  last 5 events, hidden ones included, each with `shown`).
+- `POST /control`: same checks. Body `{"paused"?: bool, "states"?: [state, …]}` (at
+  least one key, unknown keys or states → 400); returns `{paused, filter}`. Changes apply
+  to open sockets at once and are saved in `control.json`.
+  **Pause** means: `/push` still stores the event, marked `"muted": true` in
+  `events.jsonl`, but it is never broadcast and never replayed, even after unpausing or
+  a restart. There is no muted marker frame; the page simply gets nothing.
 - `GET /ws?since=<id>`: WebSocket. Frames are JSON text:
   `hello` (`version`, `last_id`, `oldest_id`, `missed`, `server_time`, `labels`), then
   one `event` per buffered event with id > `since`, then `synced`, then live `event`s.
