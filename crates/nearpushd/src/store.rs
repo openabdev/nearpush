@@ -3,11 +3,16 @@
 //! Every accepted event is written to `events.jsonl` before it is published, so ids
 //! and history survive a restart. On startup the file is reloaded; when it holds
 //! more than twice the buffer size (or a damaged line), it is rewritten with only the
-//! retained events.
+//! retained events. The same compaction runs at runtime whenever the file grows
+//! past twice the buffer size, so a long-running daemon does not grow it forever.
+//!
+//! The state directory is kept at 0700 and the log (and its compaction temp file)
+//! at 0600, because event bodies can carry build output.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +27,8 @@ struct Inner {
     cap: usize,
     next_id: u64,
     file: File,
+    /// Lines currently in the log file; compaction resets it to `buf.len()`.
+    lines: usize,
 }
 
 pub struct Store {
@@ -36,6 +43,26 @@ pub struct Subscription {
     cursor: u64,
 }
 
+/// What a subscriber receives after waiting: live events, plus how many events
+/// fell out of the ring buffer before it could resync (0 normally).
+pub struct Batch {
+    pub events: Vec<Arc<Event>>,
+    pub missed: u64,
+}
+
+/// Creates `dir` (and parents) and forces it to 0700.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
+/// Opens `path` for appending, created 0600; an existing file is forced to 0600.
+fn open_private_append(path: &Path) -> io::Result<File> {
+    let f = OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(f)
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -45,10 +72,13 @@ pub fn now_ms() -> u64 {
 
 impl Store {
     /// Opens (or creates) the store in `state_dir`. `cap` is the number of events kept
-    /// in memory; `live_cap` is the broadcast channel capacity per subscriber.
+    /// in memory; `live_cap` is the broadcast channel capacity per subscriber. The
+    /// channel is never larger than the ring, so a subscriber that lags the channel
+    /// can normally still resync from the ring.
     pub fn open(state_dir: &Path, cap: usize, live_cap: usize) -> io::Result<Store> {
         let cap = cap.max(1);
-        fs::create_dir_all(state_dir)?;
+        let live_cap = live_cap.clamp(1, cap);
+        ensure_private_dir(state_dir)?;
         let path = state_dir.join(EVENTS_FILE);
 
         let mut buf: VecDeque<Arc<Event>> = VecDeque::with_capacity(cap);
@@ -84,12 +114,13 @@ impl Store {
         }
         if bad > 0 || lines > cap * 2 {
             compact(&path, &buf)?;
+            lines = buf.len();
         }
 
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let (tx, _) = broadcast::channel(live_cap.max(1));
+        let file = open_private_append(&path)?;
+        let (tx, _) = broadcast::channel(live_cap);
         Ok(Store {
-            inner: Mutex::new(Inner { buf, cap, next_id: max_id + 1, file }),
+            inner: Mutex::new(Inner { buf, cap, next_id: max_id + 1, file, lines }),
             tx,
             path,
         })
@@ -108,11 +139,22 @@ impl Store {
         inner.file.write_all(&line)?;
         inner.file.flush()?;
         inner.next_id += 1;
+        inner.lines += 1;
         let ev = Arc::new(ev);
         if inner.buf.len() == inner.cap {
             inner.buf.pop_front();
         }
         inner.buf.push_back(ev.clone());
+        if inner.lines > inner.cap * 2 {
+            // The event is already on disk; a failed compaction leaves a longer log, not a lost event.
+            match compact(&self.path, &inner.buf).and_then(|()| open_private_append(&self.path)) {
+                Ok(f) => {
+                    inner.file = f;
+                    inner.lines = inner.buf.len();
+                }
+                Err(e) => tracing::warn!(error = %e, "runtime compaction of the event log failed"),
+            }
+        }
         // Published under the lock so a concurrent subscribe() sees each event
         // either in its snapshot or on its receiver, never both and never neither.
         let _ = self.tx.send(ev.clone());
@@ -137,14 +179,30 @@ impl Store {
         inner.buf.front().map(|e| e.id).unwrap_or(0)
     }
 
-    /// Returns the replay (events after `since`) and a subscription for what follows.
-    pub fn subscribe(&self, since: u64) -> (Vec<Arc<Event>>, Subscription) {
+    /// Returns the replay (events after `since`), how many events after `since`
+    /// are no longer buffered, and a subscription for what follows.
+    pub fn subscribe(&self, since: u64) -> (Vec<Arc<Event>>, u64, Subscription) {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let rx = self.tx.subscribe();
         let replay = since_locked(&inner, since);
+        let missed = missed_locked(&inner, since);
         // Everything up to the newest id is either in the replay or older than `since`;
         // the receiver only carries events pushed after this point.
-        (replay, Subscription { rx, cursor: inner.next_id - 1 })
+        (replay, missed, Subscription { rx, cursor: inner.next_id - 1 })
+    }
+
+    /// Buffered events after `since` and the count of those that fell out of the ring.
+    fn since_with_gap(&self, since: u64) -> (Vec<Arc<Event>>, u64) {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        (since_locked(&inner, since), missed_locked(&inner, since))
+    }
+}
+
+/// Events with id in `since+1 .. oldest buffered` were evicted (ids are dense).
+fn missed_locked(inner: &Inner, since: u64) -> u64 {
+    match inner.buf.front() {
+        Some(front) if front.id > since + 1 => front.id - since - 1,
+        _ => 0,
     }
 }
 
@@ -157,7 +215,8 @@ fn since_locked(inner: &Inner, since: u64) -> Vec<Arc<Event>> {
 fn compact(path: &Path, buf: &VecDeque<Arc<Event>>) -> io::Result<()> {
     let tmp = path.with_extension("jsonl.tmp");
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
         for ev in buf {
             let mut line = serde_json::to_vec(ev.as_ref()).map_err(io::Error::other)?;
             line.push(b'\n');
@@ -172,20 +231,23 @@ impl Subscription {
     /// Waits for the next live events. When this subscriber has fallen behind the
     /// broadcast channel, it resyncs from the ring buffer instead of being dropped.
     /// Returns `None` once the store is gone.
-    pub async fn recv(&mut self, store: &Store) -> Option<Vec<Arc<Event>>> {
+    pub async fn recv(&mut self, store: &Store) -> Option<Batch> {
         loop {
             match self.rx.recv().await {
                 Ok(ev) if ev.id > self.cursor => {
                     self.cursor = ev.id;
-                    return Some(vec![ev]);
+                    return Some(Batch { events: vec![ev], missed: 0 });
                 }
                 Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::debug!(skipped, cursor = self.cursor, "subscriber lagged; resyncing");
-                    let missed = store.since(self.cursor);
-                    if let Some(last) = missed.last() {
+                    let (events, missed) = store.since_with_gap(self.cursor);
+                    if missed > 0 {
+                        tracing::warn!(missed, cursor = self.cursor, "subscriber lagged past the ring buffer");
+                    }
+                    if let Some(last) = events.last() {
                         self.cursor = last.id;
-                        return Some(missed);
+                        return Some(Batch { events, missed });
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -231,7 +293,7 @@ mod tests {
         }
         let s = Store::open(dir.path(), 3, 16).unwrap();
         let text = fs::read_to_string(s.path()).unwrap();
-        assert_eq!(text.lines().count(), 3, "log compacted to the buffer");
+        assert!(text.lines().count() <= 6, "log compacted at runtime to at most 2x the buffer");
         assert_eq!(s.push(ev("next")).unwrap().id, 11);
     }
 
@@ -260,18 +322,99 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path(), 100, 4).unwrap();
         s.push(ev("before")).unwrap();
-        let (replay, mut sub) = s.subscribe(0);
-        assert_eq!(replay.len(), 1);
+        let (replay, missed, mut sub) = s.subscribe(0);
+        assert_eq!((replay.len(), missed), (1, 0));
         for i in 0..20 {
             s.push(ev(&format!("e{i}"))).unwrap();
         }
         let mut got = Vec::new();
         while got.len() < 20 {
-            for e in sub.recv(&s).await.unwrap() {
-                got.push(e.id);
-            }
+            let b = sub.recv(&s).await.unwrap();
+            assert_eq!(b.missed, 0);
+            got.extend(b.events.iter().map(|e| e.id));
         }
         assert_eq!(got, (2..=21).collect::<Vec<u64>>());
+    }
+
+    #[tokio::test]
+    async fn lag_past_the_ring_reports_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), 5, 4).unwrap();
+        let (_, _, mut sub) = s.subscribe(0);
+        for i in 0..20 {
+            s.push(ev(&format!("e{i}"))).unwrap();
+        }
+        // Ring holds 16..=20; the subscriber's cursor is 0, so 1..=15 are gone.
+        let b = sub.recv(&s).await.unwrap();
+        assert_eq!(b.missed, 15);
+        assert_eq!(b.events.iter().map(|e| e.id).collect::<Vec<_>>(), vec![16, 17, 18, 19, 20]);
+    }
+
+    #[test]
+    fn since_older_than_ring_reports_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), 3, 16).unwrap();
+        for i in 0..10 {
+            s.push(ev(&format!("e{i}"))).unwrap();
+        }
+        let (replay, missed, _) = s.subscribe(0);
+        assert_eq!((replay.len(), missed), (3, 7));
+        assert_eq!(s.subscribe(5).1, 2);
+        assert_eq!(s.subscribe(7).1, 0);
+        assert_eq!(s.subscribe(10).1, 0);
+    }
+
+    #[test]
+    fn broadcast_capacity_clamped_to_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tokio rounds capacity up to a power of two, so use 4 to make the bound exact.
+        let s = Store::open(dir.path(), 4, 256).unwrap();
+        let (_, _, mut sub) = s.subscribe(0);
+        for i in 0..5 {
+            s.push(ev(&format!("e{i}"))).unwrap();
+        }
+        // A 256-slot channel would still hold all five; a 4-slot one has lagged.
+        assert!(matches!(sub.rx.try_recv(), Err(broadcast::error::TryRecvError::Lagged(1))));
+    }
+
+    #[test]
+    fn files_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(state.join(EVENTS_FILE), "").unwrap();
+        fs::set_permissions(state.join(EVENTS_FILE), fs::Permissions::from_mode(0o644)).unwrap();
+        let s = Store::open(&state, 2, 16).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(s.path()), 0o600);
+        for i in 0..5 {
+            s.push(ev(&format!("e{i}"))).unwrap(); // compacts at 5 lines > 2*2
+        }
+        assert_eq!(mode(s.path()), 0o600, "compacted file keeps 0600");
+        assert!(!state.join("events.jsonl.tmp").exists());
+    }
+
+    #[test]
+    fn compacts_at_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), 3, 16).unwrap();
+        for i in 0..7 {
+            s.push(ev(&format!("e{i}"))).unwrap();
+        }
+        // Compacted to 3 lines when the 7th line passed 2*3.
+        let text = fs::read_to_string(s.path()).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        for i in 0..20 {
+            s.push(ev(&format!("f{i}"))).unwrap();
+            let n = fs::read_to_string(s.path()).unwrap().lines().count();
+            assert!(n <= 6, "log never exceeds 2x cap, got {n}");
+        }
+        drop(s);
+        let s = Store::open(dir.path(), 3, 16).unwrap();
+        assert_eq!(s.last_id(), 27);
+        assert_eq!(s.push(ev("next")).unwrap().id, 28);
     }
 
     #[test]
@@ -281,10 +424,10 @@ mod tests {
         for i in 0..5 {
             s.push(ev(&format!("e{i}"))).unwrap();
         }
-        let (replay, _) = s.subscribe(2);
+        let (replay, _, _) = s.subscribe(2);
         let ids: Vec<u64> = replay.iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![3, 4, 5]);
-        let (replay, _) = s.subscribe(99);
+        let (replay, _, _) = s.subscribe(99);
         assert!(replay.is_empty());
     }
 }

@@ -11,6 +11,7 @@ use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use nearpushd::assets;
+use nearpushd::config::SummarizerConfig;
 use nearpushd::server::{self, AppState};
 use nearpushd::store::Store;
 use serde_json::{Value, json};
@@ -28,7 +29,10 @@ struct Daemon {
 
 impl Daemon {
     async fn start(state_dir: &Path, allow_loopback: bool) -> Daemon {
-        let state = state(state_dir, allow_loopback);
+        Daemon::start_with(state(state_dir, allow_loopback)).await
+    }
+
+    async fn start_with(state: AppState) -> Daemon {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(server::serve(listener, state));
@@ -307,4 +311,141 @@ async fn manifest_is_valid_json() {
         .unwrap()
         .to_bytes();
     assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), v);
+}
+
+#[tokio::test]
+async fn ws_signals_events_missed_past_the_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path(), 3, 16).unwrap());
+    let d = Daemon::start_with(AppState::new(store, TOKEN.into(), vec![LOGIN.into()], true)).await;
+    for i in 1..=10 {
+        push_ok(&d, &format!("e{i}")).await;
+    }
+    let mut ws = open_ws(&d.ws_url(0), &[]).await.unwrap();
+    let hello = next_frame(&mut ws).await;
+    assert_eq!((hello["oldest_id"].as_u64(), hello["missed"].as_u64()), (Some(8), Some(7)));
+    assert_eq!(event_ids_until_synced(&mut ws).await, vec![8, 9, 10]);
+
+    let mut ws = open_ws(&d.ws_url(8), &[]).await.unwrap();
+    assert_eq!(next_frame(&mut ws).await["missed"], 0);
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn sender_and_context_fields_are_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), true).await;
+    let r = push(&d, json!({
+        "title": "all set.", "state": "all_set", "sender": "kiro", "app": "Kiro", "session": "s-1234",
+        "session_label": "修正登入", "host": "laptop", "detail": "took 3m", "project": "nearpush / main"
+    })).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(push(&d, json!({ "title": "t", "sender": "../etc" })).await.status(), 400);
+    let line = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+    let v: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert_eq!(v["sender"], "kiro");
+    assert_eq!(v["session"], "s-1234");
+    assert_eq!(v["detail"], "took 3m");
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn sender_icons_are_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let icons = dir.path().join("icons");
+    std::fs::create_dir(&icons).unwrap();
+    std::fs::write(icons.join("mine.png"), b"\x89PNG").unwrap();
+    let st = state(dir.path(), false).with_icons_dir(icons);
+    let d = Daemon::start_with(st).await;
+    let get = |path: &str| client().get(d.url(path)).header("tailscale-user-login", LOGIN).send();
+    assert_eq!(client().get(d.url("/icons/kiro")).send().await.unwrap().status(), 401);
+    let r = get("/icons/kiro").await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "image/svg+xml");
+    assert!(r.text().await.unwrap().contains("#9046FF"));
+    let r = get("/icons/mine").await.unwrap();
+    assert_eq!((r.status().as_u16(), r.headers()["content-type"].to_str().unwrap()), (200, "image/png"));
+    let r = get("/icons/someone").await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains(">S</text>"));
+    for bad in ["/icons/..%2Fsecret", "/icons/KIRO", "/icons/a.b"] {
+        assert_eq!(get(bad).await.unwrap().status(), 404, "{bad}");
+    }
+    d.stop().await;
+}
+
+fn summarizer_state(dir: &Path, script: &str, timeout_secs: u64) -> AppState {
+    let cfg = SummarizerConfig {
+        enabled: true,
+        command: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        timeout_secs,
+    };
+    state(dir, true)
+        .with_sessions(nearpushd::sessions::Sessions::load(dir))
+        .with_summarizer(cfg, dir.join("summarizer"))
+}
+
+/// Next frame that is not a ping, or `None` if nothing arrives within `wait`.
+async fn frame_within(ws: &mut Ws, wait: Duration) -> Option<Value> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next()).await.ok()??.ok()?;
+        if let tungstenite::Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(t.as_str()).unwrap();
+            if v["type"] != "ping" {
+                return Some(v);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn summarizer_label_is_broadcast_and_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"input=$(cat); case "$input" in *"login redirect"*) echo "  Fix login redirect." ;; *) echo other ;; esac"#;
+    let d = Daemon::start_with(summarizer_state(dir.path(), script, 10)).await;
+    let mut ws = open_ws(&d.ws_url(0), &[]).await.unwrap();
+    assert_eq!(next_frame(&mut ws).await["type"], "hello");
+    assert_eq!(next_frame(&mut ws).await["type"], "synced");
+
+    let r = push(&d, json!({ "title": "working.", "state": "working", "sender": "kiro", "session": "s1",
+        "session_label": "please fix the login redi", "prompt": "please fix the login redirect loop" })).await;
+    assert_eq!(r.status(), 200);
+    let f = frame_within(&mut ws, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(f["event"]["session_label"], "please fix the login redi", "provisional label first");
+    let f = frame_within(&mut ws, Duration::from_secs(10)).await.expect("session_update");
+    assert_eq!(f, json!({ "type": "session_update", "session": "s1", "label": "Fix login redirect" }));
+
+    // Later events of the session carry the summarized label.
+    push(&d, json!({ "title": "all set.", "state": "all_set", "session": "s1", "session_label": "prov" })).await;
+    let f = frame_within(&mut ws, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(f["event"]["session_label"], "Fix login redirect");
+    // Prompts never reach the event log; labels survive a restart via the hello frame.
+    let log = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+    assert!(!log.contains("redirect loop"));
+    d.stop().await;
+    let d = Daemon::start_with(state(dir.path(), true).with_sessions(nearpushd::sessions::Sessions::load(dir.path()))).await;
+    let mut ws = open_ws(&d.ws_url(0), &[]).await.unwrap();
+    let hello = next_frame(&mut ws).await;
+    assert_eq!(hello["labels"], json!([{ "session": "s1", "label": "Fix login redirect" }]));
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn failing_or_slow_summarizer_keeps_provisional_label() {
+    for script in ["cat >/dev/null; echo boom >&2; exit 1", "sleep 10", "cat >/dev/null"] {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Daemon::start_with(summarizer_state(dir.path(), script, 1)).await;
+        let mut ws = open_ws(&d.ws_url(0), &[]).await.unwrap();
+        next_frame(&mut ws).await;
+        next_frame(&mut ws).await;
+        push(&d, json!({ "title": "working.", "state": "working", "session": "s1", "session_label": "prov",
+            "prompt": "fix the login redirect" })).await;
+        assert_eq!(frame_within(&mut ws, Duration::from_secs(5)).await.unwrap()["type"], "event");
+        assert!(frame_within(&mut ws, Duration::from_millis(2500)).await.is_none(), "{script}: no session_update");
+        push(&d, json!({ "title": "all set.", "state": "all_set", "session": "s1", "session_label": "prov" })).await;
+        let f = frame_within(&mut ws, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(f["event"]["session_label"], "prov", "{script}");
+        d.stop().await;
+    }
 }

@@ -8,7 +8,8 @@ use nearpushd::server::{self, AppState};
 use nearpushd::store::Store;
 use tokio::signal::unix::{SignalKind, signal};
 
-/// Broadcast capacity per subscriber; slower subscribers resync from the buffer.
+/// Broadcast capacity per subscriber (clamped to buffer_size); slower subscribers
+/// resync from the buffer.
 const LIVE_CAPACITY: usize = 256;
 const DISCOVERY_RETRY: Duration = Duration::from_secs(30);
 
@@ -56,7 +57,16 @@ async fn run(args: Args) -> std::io::Result<()> {
         "event store loaded"
     );
 
-    let state = AppState::new(store, token, cfg.allowed_logins.clone(), cfg.allow_loopback_without_login);
+    let sessions = nearpushd::sessions::Sessions::load(&paths.state_dir);
+    if cfg.summarizer.enabled {
+        tracing::info!(command = ?cfg.summarizer.command, "session summarizer enabled");
+    } else {
+        tracing::info!("session summarizer disabled");
+    }
+    let state = AppState::new(store, token, cfg.allowed_logins.clone(), cfg.allow_loopback_without_login)
+        .with_sessions(sessions)
+        .with_summarizer(cfg.summarizer.clone(), paths.state_dir.join("summarizer"))
+        .with_icons_dir(paths.config_dir.join("icons"));
     if cfg.allowed_logins.is_empty() {
         // tailscaled may not be up yet at login, so keep trying in the background.
         let allowed = state.allowed_logins.clone();

@@ -13,8 +13,13 @@ shows one big status card at a time, built for coding-agent states:
 | `working`   | **working.** in grey                  | `5m so far` (live) |
 | *(none)*    | the title, coloured by `--level` (info white, warn amber, error red) | |
 
-Below the headline come the subtitle (or body), the task line (the title) and a footer
-with the project. A swipe up, or the ☰ button, opens a drawer with the last 100 events;
+The top line shows the sender icon, the app name, the timer and a short session tag
+(`#` plus the last 4 characters of the session id). Below the headline come the project
+(and host), the session label, the task line (the title, unless it only repeats the
+headline) and the detail line (`detail`, else the subtitle or body). Every line is cut
+with an ellipsis, so the card never scrolls. The footer holds the time and, after a gap
+in the replay, a small "N events missed" note for two minutes. A swipe up, or the ☰
+button, opens a drawer with the last 100 events, each with its icon and session tag;
 tapping one shows it until the next event arrives. When an event has a `url`, tapping
 the card opens it in Safari.
 
@@ -47,7 +52,12 @@ scp macmini:~/repo/nearpush/target/release/{nearpushd,nearpush} ~/.local/bin/
 |------|------|
 | `~/.config/nearpush/config.toml` | optional config (below) |
 | `~/.config/nearpush/token` | push token, created on first start with mode 0600 |
-| `~/.local/state/nearpush/events.jsonl` | one JSON event per line, reloaded on start |
+| `~/.local/state/nearpush/events.jsonl` | one JSON event per line, reloaded on start (0600) |
+| `~/.local/state/nearpush/sessions.json` | per-session prompt history (capped) and summarized labels (0600) |
+| `~/.local/state/nearpush/hooks/*.json` | `nearpush hook` per-session state (0600) |
+| `~/.config/nearpush/icons/<sender>.{svg,png}` | optional icon overrides |
+
+The state directory is forced to 0700 and its files to 0600 on every start.
 
 `NEARPUSH_CONFIG_DIR` and `NEARPUSH_STATE_DIR` (or `--config-dir` / `--state-dir`)
 override the two directories.
@@ -58,14 +68,47 @@ listen = "127.0.0.1:8787"        # must be loopback; nearpushd refuses anything 
 allowed_logins = ["you@example.com"]  # Tailscale-User-Login values allowed to view
 buffer_size = 500                # events kept in memory for replay (1..=10000)
 allow_loopback_without_login = false  # local testing: let header-less loopback requests view
+
+[summarizer]                     # LLM that labels each Kiro session with its purpose
+enabled = true
+command = ["kiro-cli", "chat", "--no-interactive", "--model", "claude-haiku-5.5", "--trust-tools="]
+timeout_secs = 30
 ```
+
+The broadcast channel per viewer is never larger than `buffer_size`, so a viewer that
+falls behind can normally resync from the buffer. When it cannot, or when a reconnecting
+page asks for events older than the buffer, the daemon says how many were skipped and the
+page shows the "N events missed" note.
 
 When `allowed_logins` is empty, nearpushd asks `tailscale status --json` for this node's
 own login (it retries every 30 s until tailscaled answers) and allows only that login.
 Set the list explicitly to share the display with another tailnet user.
 
 The event log is compacted on start when it holds more than twice `buffer_size` lines
-(or a damaged line). The newest events are kept, so ids never go backwards.
+(or a damaged line), and again at runtime whenever it passes twice `buffer_size`. The
+newest events are kept, so ids never go backwards.
+
+### Session labels
+
+`nearpush hook` sends the user's prompt with each UserPromptSubmit event (field
+`prompt`). The daemon never writes it to `events.jsonl`; it keeps the first prompt and
+the last four per session (500 characters each, 100 sessions) in `sessions.json`, and
+runs the summarizer on a session's first prompt, every fifth prompt, and when a prompt
+shares almost nothing with the earlier ones. Runs are debounced, one at a time, killed
+after `timeout_secs`. The command gets a fixed instruction plus the prompts on stdin and
+must print the label on stdout; it is cut to 30 CJK or 50 other characters. It runs in
+`~/.local/state/nearpush/summarizer/` with `NEARPUSH_DISABLE=1` set, which makes
+`nearpush hook` exit at once, so a summarizer kiro-cli run with the nearpush hooks
+installed does not report itself. A new label is broadcast as a `session_update` frame;
+the page updates that session's cards in place, and later events of the session carry
+the label. If the summarizer is missing, fails or times out, the hook's provisional
+label (the first prompt, truncated to 40 characters) stays and a warning is logged.
+
+The default kiro-cli command needs a login that the LaunchAgent can see. A `KIRO_API_KEY`
+exported in an interactive shell (or injected by a running Kiro session) is not in
+launchd's environment, so `kiro-cli chat` from nearpushd answers "Not logged in" until
+`kiro-cli login` has been run on the laptop (`kiro-cli whoami`, run without
+`KIRO_API_KEY` set, shows whether it has).
 
 ## Run
 
@@ -134,14 +177,75 @@ make 2>&1 | tail -20 | nearpush send --title "make output" --body -
 | `--state` | `allow`, `your_turn`, `all_set`, `working` (`your-turn`/`all-set` also accepted) |
 | `--subtitle` | short line under the headline (≤ 200 chars) |
 | `--project` | footer text (≤ 100 chars) |
-| `--started-at` | `now`, unix seconds or milliseconds, or an age such as `18m` / `1h5m`; drives the live "Xm so far" |
+| `--started-at` | `now`, unix seconds or milliseconds, an RFC 3339 time such as `2026-11-04T18:49:33Z` or `2026-11-05T02:49:33+08:00` (an offset is required), or an age such as `18m` / `1h5m`; drives the live "Xm so far" |
 | `--duration` | `65`, `90s`, `1m`, `1h5m`; shown as "took Xm" |
 | `--url` | http(s) link opened when the card is tapped |
 | `--tag` | repeatable, ≤ 10 tags of ≤ 32 chars |
+| `--sender` | icon key, `[a-z0-9-]`, ≤ 32 chars; default `cli` |
+| `--app` | app name on the top line (≤ 32 chars); default derived from the sender |
+| `--session` | stable session id (≤ 128 chars); its last 4 characters become the tag |
+| `--session-label` | what the session is for (≤ 100 chars) |
+| `--host` | machine name (≤ 64 chars) |
+| `--detail` | extra context line (≤ 300 chars) |
 | `--addr` / `NEARPUSH_ADDR` | daemon URL, default `http://127.0.0.1:8787` |
 | `--token-file` / `NEARPUSH_TOKEN_FILE` | default `~/.config/nearpush/token` |
 
 It prints `sent event #<id>` and exits 0, or prints the reason and exits 1.
+
+## Kiro CLI hooks
+
+`nearpush hook` reads a [Kiro hook event](https://kiro.dev/docs/hooks/types/) on stdin
+(`hook_event_name`, `cwd`, `session_id`, plus `prompt` or `tool_name`/`tool_input`) and
+pushes a card with sender `kiro`, app `Kiro`, the project (cwd basename and git branch,
+read from `.git/HEAD`), the session id, the label, the host and a detail line:
+
+| Kiro event | Card |
+|------------|------|
+| `UserPromptSubmit` | `working.`; starts the turn timer and sends the prompt to the summarizer |
+| `PreToolUse` | `working.` with `tool: summary`, e.g. `execute_bash: cargo test` (the same tool is re-sent at most every 5 s) |
+| `Stop` | `all set.` with `took Xm` |
+| `SessionStart`, `PostToolUse` | nothing |
+| `SessionEnd` | removes the session's state file |
+
+It never shows `allow.`: the hook input carries no approval information (see below). The
+tool summary uses only `command`, `path`/`file_path`, `url`, `query` or `pattern`, keeps
+the first line, and hides env assignments (`TOKEN=…`), values after secret-looking flags,
+`Bearer` credentials, URL passwords and token-shaped words.
+
+The hook always exits 0, prints nothing on stdout (Kiro adds a successful
+SessionStart/UserPromptSubmit hook's stdout to the agent's context), gives the daemon
+under a second, and stays quiet when the daemon is down. With `NEARPUSH_DISABLE=1` it
+exits before reading anything.
+
+Add the entries in [`examples/kiro-agent-hooks.json`](examples/kiro-agent-hooks.json) to
+the `hooks` array of an agent profile in `~/.kiro/agents/<agent>.json`:
+
+```json
+"hooks": [
+  { "name": "nearpush-prompt", "trigger": "UserPromptSubmit", "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 },
+  { "name": "nearpush-tool",   "trigger": "PreToolUse",       "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 },
+  { "name": "nearpush-stop",   "trigger": "Stop",             "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 },
+  { "name": "nearpush-end",    "trigger": "SessionEnd",       "action": { "type": "command", "command": "~/.local/bin/nearpush hook" }, "timeout": 3 }
+]
+```
+
+Replace `~` with your home directory if your shell setup does not expand it. To cover
+every agent instead, put the same four entries in a standalone hook file,
+`~/.kiro/hooks/nearpush.json`, as `{ "version": "v1", "hooks": [ ... ] }` (CLI V3 loads
+global hook files for every workspace). Use one of the two placements, not both, or each
+event is pushed twice.
+
+### Why there is no `allow.` from hooks
+
+Kiro's `PreToolUse` fires for every tool call, before the permission check is known to
+the hook, and its input has no field saying whether the call will prompt. Whether it
+prompts depends on rules from several scopes (Kiro's built-in asks, managed policy,
+`~/.kiro/settings/permissions.yaml`, the workspace, the agent's `permissions`, approvals
+given earlier in the session, and the `approve-for-me` classifier), so the hook cannot
+reproduce the decision. Kiro also has no hook for "waiting for approval" or "waiting for
+input": `Stop` (the turn finished) is the only moment the agent waits for the user, and
+it maps to `all set.`. Use `nearpush send --state allow` or `--state your_turn` by hand
+or from another tool.
 
 ## HTTP API
 
@@ -152,12 +256,19 @@ It prints `sent event #<id>` and exits 0, or prints the reason and exits 1.
   with 403, so nothing coming through `tailscale serve` can push. Bodies over 16 KiB get 413;
   unknown fields or values that break a limit get 400. Returns `{"id":N,"ts":ms}`.
 - `GET /ws?since=<id>`: WebSocket. Frames are JSON text:
-  `hello` (`version`, `last_id`, `oldest_id`, `server_time`), then one `event` per
-  buffered event with id > `since`, then `synced`, then live `event`s. A protocol ping and
-  a `{"type":"ping"}` frame go out every 20 s. A subscriber that falls behind the live
-  channel is resynced from the buffer, not dropped. A browser `Origin` must match the
-  `Host` header.
-- `GET /`, `/manifest.webmanifest`, `/icon-*.png`: need an allowlisted
+  `hello` (`version`, `last_id`, `oldest_id`, `missed`, `server_time`, `labels`), then
+  one `event` per buffered event with id > `since`, then `synced`, then live `event`s.
+  `missed` counts events after `since` that are no longer buffered; `labels` lists known
+  `{session, label}` pairs. A protocol ping and a `{"type":"ping"}` frame go out every
+  20 s. A subscriber that falls behind the live channel is resynced from the buffer, not
+  dropped; if events fell out of the buffer meanwhile it first gets `{"type":"missed",
+  "missed":N}`. `{"type":"session_update","session":…,"label":…}` arrives when the
+  summarizer labels a session. A browser `Origin` must match the `Host` header.
+- `GET /icons/<sender>`: the sender's icon. `~/.config/nearpush/icons/<sender>.svg`, then
+  `.png`, then a built-in icon (`kiro`: the official logo from <https://kiro.dev/icon.svg>),
+  then a generated tile with the sender's first letter. Only `[a-z0-9-]{1,32}` names
+  resolve; anything else is 404.
+- `GET /`, `/manifest.webmanifest`, `/icon-*.png`, `/icons/*`: need an allowlisted
   `Tailscale-User-Login` (or the local-testing flag).
 
 ## iPhone

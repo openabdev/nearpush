@@ -1,0 +1,12 @@
+# ~/.config/nearpush/config.toml: every key is optional; these are the defaults.
+listen = "127.0.0.1:8787"
+allowed_logins = []                 # empty: this node's own tailnet login
+buffer_size = 500
+allow_loopback_without_login = false
+
+[summarizer]
+enabled = true
+# The prompts go on stdin, the label is read from stdout. Runs in
+# ~/.local/state/nearpush/summarizer/ with NEARPUSH_DISABLE=1 set.
+command = ["kiro-cli", "chat", "--no-interactive", "--model", "claude-haiku-5.5", "--trust-tools="]
+timeout_secs = 30

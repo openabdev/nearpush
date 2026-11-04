@@ -56,6 +56,32 @@ pub struct Config {
     /// Local testing only: let loopback requests without `Tailscale-User-Login`
     /// open the page and the socket.
     pub allow_loopback_without_login: bool,
+    /// LLM command that turns a session's prompts into a short purpose label.
+    pub summarizer: SummarizerConfig,
+}
+
+/// Default summarizer: a non-interactive kiro-cli run on a cheap model with no tools trusted.
+pub const DEFAULT_SUMMARIZER_COMMAND: &[&str] =
+    &["kiro-cli", "chat", "--no-interactive", "--model", "claude-haiku-5.5", "--trust-tools="];
+pub const DEFAULT_SUMMARIZER_TIMEOUT_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SummarizerConfig {
+    pub enabled: bool,
+    /// argv; the prompt goes on stdin and the label is read from stdout.
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+impl Default for SummarizerConfig {
+    fn default() -> Self {
+        SummarizerConfig {
+            enabled: true,
+            command: DEFAULT_SUMMARIZER_COMMAND.iter().map(|s| s.to_string()).collect(),
+            timeout_secs: DEFAULT_SUMMARIZER_TIMEOUT_SECS,
+        }
+    }
 }
 
 impl Default for Config {
@@ -65,6 +91,7 @@ impl Default for Config {
             allowed_logins: Vec::new(),
             buffer_size: DEFAULT_BUFFER,
             allow_loopback_without_login: false,
+            summarizer: SummarizerConfig::default(),
         }
     }
 }
@@ -97,6 +124,12 @@ impl Config {
                 io::ErrorKind::InvalidInput,
                 format!("buffer_size must be 1..={MAX_BUFFER}"),
             ));
+        }
+        if self.summarizer.enabled && self.summarizer.command.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "summarizer.command is empty"));
+        }
+        if self.summarizer.timeout_secs == 0 || self.summarizer.timeout_secs > 300 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "summarizer.timeout_secs must be 1..=300"));
         }
         Ok(())
     }
@@ -195,6 +228,20 @@ mod tests {
         let cfg: Config = toml::from_str(r#"listen = "127.0.0.1:9000""#).unwrap();
         assert!(cfg.validate().is_ok());
         assert!(toml::from_str::<Config>(r#"lisen = "x""#).is_err());
+    }
+
+    #[test]
+    fn summarizer_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.summarizer.enabled);
+        assert_eq!(cfg.summarizer.command[0], "kiro-cli");
+        assert!(cfg.summarizer.command.iter().any(|a| a == "--trust-tools="));
+        let cfg: Config = toml::from_str("[summarizer]\nenabled = false").unwrap();
+        assert!(!cfg.summarizer.enabled);
+        let cfg: Config = toml::from_str("[summarizer]\ncommand = [\"sh\", \"-c\", \"echo hi\"]\ntimeout_secs = 5").unwrap();
+        assert_eq!(cfg.summarizer.command.len(), 3);
+        assert!(cfg.validate().is_ok());
+        assert!(toml::from_str::<Config>("[summarizer]\nbogus = 1").is_err());
     }
 
     #[test]

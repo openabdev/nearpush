@@ -9,6 +9,14 @@ pub const MAX_BODY_CHARS: usize = 4000;
 pub const MAX_URL_CHARS: usize = 2048;
 pub const MAX_TAGS: usize = 10;
 pub const MAX_TAG_CHARS: usize = 32;
+pub const MAX_SENDER_CHARS: usize = 32;
+pub const MAX_APP_CHARS: usize = 32;
+pub const MAX_SESSION_CHARS: usize = 128;
+pub const MAX_SESSION_LABEL_CHARS: usize = 100;
+pub const MAX_HOST_CHARS: usize = 64;
+pub const MAX_DETAIL_CHARS: usize = 300;
+/// Longest prompt accepted for the session summarizer (never stored in events).
+pub const MAX_PROMPT_CHARS: usize = 4000;
 /// Longest accepted `duration_ms` (30 days).
 pub const MAX_DURATION_MS: u64 = 30 * 24 * 3600 * 1000;
 /// How far in the future `started_at` may lie (clock skew allowance).
@@ -62,6 +70,26 @@ pub struct NewEvent {
     pub url: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Icon key: `[a-z0-9-]`, at most 32 characters, e.g. `kiro`, `cli`.
+    #[serde(default)]
+    pub sender: Option<String>,
+    /// Display name of the sending app, e.g. "Kiro".
+    #[serde(default)]
+    pub app: Option<String>,
+    /// Stable session id, so cards from two sessions can be told apart.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Human-readable session purpose.
+    #[serde(default)]
+    pub session_label: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Extra context line, e.g. the tool being run or "took 3m".
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// The user's prompt, fed to the session summarizer. Never persisted.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// A stored event, as persisted in JSONL and sent to subscribers.
@@ -89,6 +117,35 @@ pub struct Event {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `[a-z0-9-]`, 1..=32 characters. Also used to resolve `/icons/<sender>`, so it
+/// must never admit `/`, `.` or anything else a path could be built from.
+pub fn valid_sender(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_SENDER_CHARS
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Cleans and length-checks an optional single-line field.
+fn opt_field(field: &str, value: Option<String>, max: usize) -> Result<Option<String>, String> {
+    let v = clean(value);
+    if let Some(s) = &v {
+        check_len(field, s, max)?;
+    }
+    Ok(v)
 }
 
 fn check_len(field: &str, value: &str, max: usize) -> Result<(), String> {
@@ -154,6 +211,18 @@ impl NewEvent {
             check_len("tag", &t, MAX_TAG_CHARS)?;
             tags.push(t);
         }
+        let sender = clean(self.sender);
+        if let Some(s) = &sender {
+            if !valid_sender(s) {
+                return Err("sender must be 1-32 characters of a-z, 0-9 and -".into());
+            }
+        }
+        let app = opt_field("app", self.app, MAX_APP_CHARS)?;
+        let session = opt_field("session", self.session, MAX_SESSION_CHARS)?;
+        let session_label = opt_field("session_label", self.session_label, MAX_SESSION_LABEL_CHARS)?;
+        let host = opt_field("host", self.host, MAX_HOST_CHARS)?;
+        let detail = opt_field("detail", self.detail, MAX_DETAIL_CHARS)?;
+        let prompt = opt_field("prompt", self.prompt, MAX_PROMPT_CHARS)?;
         Ok(NewEvent {
             title,
             body,
@@ -165,6 +234,13 @@ impl NewEvent {
             duration_ms: self.duration_ms,
             url,
             tags,
+            sender,
+            app,
+            session,
+            session_label,
+            host,
+            detail,
+            prompt,
         })
     }
 
@@ -182,6 +258,12 @@ impl NewEvent {
             duration_ms: self.duration_ms,
             url: self.url,
             tags: self.tags,
+            sender: self.sender,
+            app: self.app,
+            session: self.session,
+            session_label: self.session_label,
+            host: self.host,
+            detail: self.detail,
         }
     }
 }
@@ -229,6 +311,37 @@ mod tests {
         let mut e = ev("t");
         e.tags = (0..=MAX_TAGS).map(|i| i.to_string()).collect();
         assert!(e.validate(1).is_err());
+    }
+
+    #[test]
+    fn sender_validated() {
+        for ok in ["kiro", "cli", "a", "my-agent-2", &"x".repeat(32)] {
+            assert!(valid_sender(ok), "{ok}");
+            let mut e = ev("t");
+            e.sender = Some(ok.to_string());
+            assert!(e.validate(1).is_ok(), "{ok}");
+        }
+        for bad in ["", "Kiro", "../etc", "a/b", "a.svg", "a b", "ki_ro", "é", &"x".repeat(33)] {
+            assert!(!valid_sender(bad), "{bad}");
+        }
+        let mut e = ev("t");
+        e.sender = Some("../x".into());
+        assert!(e.validate(1).is_err());
+    }
+
+    #[test]
+    fn context_fields_bounded_and_prompt_not_stored() {
+        let mut e = ev("t");
+        e.session_label = Some("修".repeat(MAX_SESSION_LABEL_CHARS + 1));
+        assert!(e.validate(1).is_err());
+        let mut e = ev("t");
+        e.app = Some("Kiro".into());
+        e.session = Some("abc".into());
+        e.prompt = Some("fix the login bug".into());
+        let e = e.validate(1).unwrap().into_event(1, 1);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"app\":\"Kiro\""));
+        assert!(!json.contains("login bug"), "prompt must not reach the stored event");
     }
 
     #[test]

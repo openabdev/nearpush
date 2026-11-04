@@ -1,6 +1,7 @@
-//! HTTP routes: `POST /push`, `GET /ws`, and the embedded page.
+//! HTTP routes: `POST /push`, `GET /ws`, `GET /icons/<sender>` and the embedded page.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -8,7 +9,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{
-        ConnectInfo, DefaultBodyLimit, Query, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -17,10 +18,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+use tokio::sync::broadcast;
 
 use crate::assets;
+use crate::config::SummarizerConfig;
 use crate::event::{Event, NewEvent};
+use crate::sessions::{SessionUpdate, Sessions};
 use crate::store::{Store, now_ms};
+use crate::summarizer::Summarizer;
 
 /// Largest accepted `POST /push` body.
 pub const MAX_PUSH_BYTES: usize = 16 * 1024;
@@ -37,6 +42,14 @@ pub struct AppState {
     pub allowed_logins: Arc<RwLock<Vec<String>>>,
     pub allow_loopback_without_login: bool,
     pub ping_interval: Duration,
+    /// Prompt history and labels per session.
+    pub sessions: Arc<Sessions>,
+    /// `session_update` frames for every connected page.
+    pub updates: broadcast::Sender<SessionUpdate>,
+    /// `None` when summarizing is disabled.
+    pub summarizer: Option<Summarizer>,
+    /// User icon overrides (`~/.config/nearpush/icons`).
+    pub icons_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -47,7 +60,29 @@ impl AppState {
             allowed_logins: Arc::new(RwLock::new(allowed_logins)),
             allow_loopback_without_login,
             ping_interval: DEFAULT_PING_INTERVAL,
+            sessions: Arc::new(Sessions::in_memory()),
+            updates: broadcast::channel(64).0,
+            summarizer: None,
+            icons_dir: None,
         }
+    }
+
+    pub fn with_sessions(mut self, sessions: Sessions) -> Self {
+        self.sessions = Arc::new(sessions);
+        self
+    }
+
+    /// Starts the summarizer worker (needs a Tokio runtime). `workdir` is its cwd.
+    pub fn with_summarizer(mut self, cfg: SummarizerConfig, workdir: PathBuf) -> Self {
+        if cfg.enabled {
+            self.summarizer = Some(Summarizer::spawn(cfg, workdir, self.sessions.clone(), self.updates.clone()));
+        }
+        self
+    }
+
+    pub fn with_icons_dir(mut self, dir: PathBuf) -> Self {
+        self.icons_dir = Some(dir);
+        self
     }
 }
 
@@ -61,6 +96,7 @@ pub fn router(state: AppState) -> Router {
         .route("/apple-touch-icon.png", icon(assets::ICON_180))
         .route("/icon-192.png", icon(assets::ICON_192))
         .route("/icon-512.png", icon(assets::ICON_512))
+        .route("/icons/{sender}", get(sender_icon))
         .layer(DefaultBodyLimit::max(MAX_PUSH_BYTES))
         .with_state(state)
 }
@@ -176,15 +212,35 @@ async fn push(
     authorize_push(peer, &headers, &state.token)?;
     let new: NewEvent = serde_json::from_slice(&body)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid payload: {e}")))?;
-    let new = new.validate(now_ms()).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    let mut new = new.validate(now_ms()).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    // The prompt only feeds the summarizer; it is never stored with the event.
+    let prompt = new.prompt.take();
+    let session = new.session.clone();
+    if let Some(label) = session.as_deref().and_then(|s| state.sessions.label(s)) {
+        // A summarized label replaces the hook's provisional one.
+        new.session_label = Some(label);
+    }
     let store = state.store.clone();
-    let ev = tokio::task::spawn_blocking(move || store.push(new))
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to persist event");
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to persist event: {e}"))
-        })?;
+    let sessions = state.sessions.clone();
+    let (ev, summarize) = tokio::task::spawn_blocking(move || {
+        let ev = store.push(new)?;
+        let summarize = match (session.as_deref(), prompt.as_deref()) {
+            (Some(s), Some(p)) => sessions.record_prompt(s, p, ev.ts),
+            _ => false,
+        };
+        Ok::<_, std::io::Error>((ev, summarize))
+    })
+    .await
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| {
+        tracing::error!(error = %e, "failed to persist event");
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to persist event: {e}"))
+    })?;
+    if summarize {
+        if let (Some(sum), Some(s)) = (&state.summarizer, ev.session.as_deref()) {
+            sum.request(s);
+        }
+    }
     tracing::info!(id = ev.id, title = %ev.title, "event accepted");
     Ok(Json(PushResponse { id: ev.id, ts: ev.ts }))
 }
@@ -234,6 +290,19 @@ fn icon(bytes: &'static [u8]) -> MethodRouter<AppState> {
     )
 }
 
+async fn sender_icon(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(sender): Path<String>,
+) -> Result<Response, ApiError> {
+    authorize_viewer(&state, peer, &headers)?;
+    let sender = sender.strip_suffix(".svg").unwrap_or(&sender);
+    let icon = assets::resolve_icon(state.icons_dir.as_deref(), sender)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown sender"))?;
+    Ok((page_headers(icon.content_type, "public, max-age=3600"), icon.bytes.into_owned()).into_response())
+}
+
 #[derive(Deserialize)]
 struct WsParams {
     #[serde(default)]
@@ -244,8 +313,14 @@ struct WsParams {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Frame<'a> {
-    Hello { version: &'a str, last_id: u64, oldest_id: u64, server_time: u64 },
+    /// `missed`: events after the client's `since` that are no longer buffered.
+    /// `labels`: known session labels, so a reloaded page shows summarized labels.
+    Hello { version: &'a str, last_id: u64, oldest_id: u64, missed: u64, server_time: u64, labels: &'a [SessionUpdate] },
     Event { event: &'a Event },
+    /// The connection lagged past the ring buffer; this many events were skipped.
+    Missed { missed: u64 },
+    /// A session's label changed; update cards of that session in place.
+    SessionUpdate { session: &'a str, label: &'a str },
     /// Replay finished; everything after this is live.
     Synced { last_id: u64 },
     /// Application-level heartbeat so the page can detect a dead socket.
@@ -271,12 +346,16 @@ async fn ws(
 
 async fn stream(mut socket: WebSocket, state: AppState, since: u64) {
     let store = state.store.clone();
-    let (replay, mut sub) = store.subscribe(since);
+    let mut updates = state.updates.subscribe();
+    let (replay, missed, mut sub) = store.subscribe(since);
+    let labels = state.sessions.labels();
     let hello = Frame::Hello {
         version: assets::ui_version(),
         last_id: store.last_id(),
         oldest_id: store.oldest_id(),
+        missed,
         server_time: now_ms(),
+        labels: &labels,
     };
     if socket.send(text(&hello)).await.is_err() {
         return;
@@ -297,10 +376,25 @@ async fn stream(mut socket: WebSocket, state: AppState, since: u64) {
         tokio::select! {
             batch = sub.recv(&store) => {
                 let Some(batch) = batch else { break };
-                for ev in &batch {
+                if batch.missed > 0 && socket.send(text(&Frame::Missed { missed: batch.missed })).await.is_err() {
+                    return;
+                }
+                for ev in &batch.events {
                     if socket.send(text(&Frame::Event { event: ev })).await.is_err() {
                         return;
                     }
+                }
+            }
+            update = updates.recv() => {
+                match update {
+                    Ok(u) => {
+                        let f = Frame::SessionUpdate { session: &u.session, label: &u.label };
+                        if socket.send(text(&f)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {}
                 }
             }
             _ = ticker.tick() => {
