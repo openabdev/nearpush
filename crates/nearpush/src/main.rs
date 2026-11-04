@@ -2,6 +2,7 @@
 //! `nearpush hook`: Kiro CLI hook adapter; reads the hook event JSON on stdin.
 
 mod hook;
+mod kiro;
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -144,6 +145,11 @@ struct Payload {
     /// Sent only by `hook` at UserPromptSubmit, for the daemon's session summarizer.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
+    /// Sent only by `hook` at Stop: this session's workflow runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflows_running: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflows_waiting: Option<u32>,
 }
 
 fn now_ms() -> u64 {
@@ -391,6 +397,8 @@ async fn run(cli: Cli) -> Result<(), String> {
                 host: a.host,
                 detail: a.detail,
                 prompt: None,
+                workflows_running: None,
+                workflows_waiting: None,
             };
             let id = send(&cli.addr, &token, &payload).await?;
             println!("sent event #{id}");

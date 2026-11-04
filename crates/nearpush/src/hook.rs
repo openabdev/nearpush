@@ -7,12 +7,20 @@
 //! to stdout. It always exits 0: a hook failure must not reach the agent.
 //!
 //! Mapping:
-//! - UserPromptSubmit → `working`, starts the turn timer.
+//! - UserPromptSubmit → `working`, starts the turn timer. The daemon's default
+//!   display filter hides `working`, but the event is still stored and the timer
+//!   still feeds "took Xm" at Stop.
 //! - PreToolUse → `working` with the tool name and a redacted summary. Kiro's hook
 //!   input says nothing about whether the call needs approval, so `allow` is never
-//!   guessed.
-//! - Stop → `all_set` with "took Xm".
+//!   guessed. Only useful when `working` is enabled in `[filter] states`.
+//! - Stop → `your_turn` when the turn ended waiting on the user (see
+//!   [`classify_turn_end`]) or a workflow run of this session is paused waiting;
+//!   otherwise `all_set` with "took Xm". The reply text comes from a stdin field if
+//!   Kiro ever sends one, else from the session transcript (see [`crate::kiro`]).
 //! - SessionStart / PostToolUse → no event; SessionEnd removes the session's state.
+//!
+//! Workflow-step / sub-agent sessions (per their `session.json`) push nothing
+//! unless `[hook] include_subagents = true` in config.toml.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -55,6 +63,10 @@ pub struct HookInput {
     pub prompt: Option<String>,
     pub tool_name: Option<String>,
     pub tool_input: Option<Value>,
+    /// Not sent by Kiro today (Kiro#6258); read first if a future version adds one.
+    pub response: Option<String>,
+    pub assistant_response: Option<String>,
+    pub last_assistant_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +116,10 @@ pub struct Context {
     pub env_prompt: Option<String>,
     /// Used when the input has no session id.
     pub fallback_session: Option<String>,
+    /// Stop only: the turn's final reply text.
+    pub final_text: Option<String>,
+    /// Stop only: this session's workflow runs `(running, waiting)`.
+    pub workflows: Option<(u32, u32)>,
 }
 
 /// Session id: `session_id`, then `conversation_id`, then the caller's fallback
@@ -252,6 +268,141 @@ pub fn tool_detail(tool: &str, input: Option<&Value>) -> String {
     truncate(&s, MAX_DETAIL_CHARS)
 }
 
+// ---- turn-end classifier ----------------------------------------------------------
+
+/// Lines of the reply's end that the classifier looks at.
+const CLASSIFY_TAIL_LINES: usize = 8;
+
+/// Phrases that ask the user for a decision (matched case-insensitively in the
+/// last 3 lines).
+const ASK_PHRASES: &[&str] = &[
+    "請選", "要不要", "你決定", "跟我說", "告訴我", "要我", "是否要", "可以嗎", "好嗎", "選哪", "哪一個",
+    "which option", "should i", "let me know", "your call", "do you want", "would you like", "shall i",
+    "want me to", "please confirm",
+];
+
+/// Words that make a `:`-ended intro line a choice prompt.
+const CHOICE_CUES: &[&str] = &["option", "choose", "pick", "which", "選", "方案", "哪"];
+
+/// Strips markdown decoration: bold/code markers, headings, quotes, bullets, and
+/// trailing `*` / `_`.
+fn strip_markdown(line: &str) -> String {
+    let s = line.replace("**", "").replace('`', "");
+    let mut s = s.trim();
+    loop {
+        let before = s;
+        s = s.trim_start_matches(['#', '>']).trim_start();
+        for bullet in ["- ", "* ", "+ "] {
+            if let Some(rest) = s.strip_prefix(bullet) {
+                s = rest.trim_start();
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    s.trim_end_matches(['*', '_']).trim_end().to_string()
+}
+
+fn ends_with_question(line: &str) -> bool {
+    line.trim_end_matches([')', '）', '"', '」', '*', '_', ' ']).ends_with(['?', '？'])
+}
+
+/// `1.` `2)` `3、` `A.` `b)` `①` followed by text.
+fn is_option_line(line: &str) -> bool {
+    let s = line.trim_start();
+    let mut chars = s.chars();
+    let Some(c) = chars.next() else { return false };
+    let rest: &str = if c.is_ascii_digit() {
+        let r = s.trim_start_matches(|c: char| c.is_ascii_digit());
+        match r.chars().next() {
+            Some('.' | ')' | '、') => &r[r.chars().next().unwrap().len_utf8()..],
+            _ => return false,
+        }
+    } else if matches!(c, 'A'..='D' | 'a'..='d') {
+        match chars.next() {
+            Some('.' | ')') => &s[2..],
+            _ => return false,
+        }
+    } else if ('①'..='⑨').contains(&c) {
+        &s[c.len_utf8()..]
+    } else {
+        return false;
+    };
+    rest.trim_start().chars().next().is_some_and(|c| !c.is_whitespace())
+}
+
+/// Did the turn end waiting on the user? Returns the question line (redacted,
+/// truncated) for `your_turn`, `None` for `all_set`. Local and fast; never waits
+/// on a model.
+///
+/// Rules, on the last 8 non-empty lines outside fenced code blocks:
+/// 1. The last line ends with `?` / `？`.
+/// 2. At least two option lines (`1.`, `A)`, `①`…) in a group whose intro line,
+///    within 2 lines before it, ends with `?`, or ends with `:` and names a choice
+///    ("option", "which", "選", "方案", "哪"…). A plain "Changes:\n1. …" stays all_set.
+/// 3. One of the last 3 lines contains an asking phrase ("should I", "let me know",
+///    "要不要", "可以嗎"…).
+pub fn classify_turn_end(text: &str) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for raw in text.lines() {
+        let t = raw.trim();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let l = strip_markdown(t);
+        if !l.is_empty() {
+            lines.push(l);
+        }
+    }
+    let tail = &lines[lines.len().saturating_sub(CLASSIFY_TAIL_LINES)..];
+    let found = (|| {
+        let last = tail.last()?;
+        if ends_with_question(last) {
+            return Some(last.clone());
+        }
+        if let Some(end) = tail.iter().rposition(|l| is_option_line(l)) {
+            let mut start = end;
+            while start > 0 && is_option_line(&tail[start - 1]) {
+                start -= 1;
+            }
+            if end - start + 1 >= 2 {
+                for intro in tail[start.saturating_sub(2)..start].iter().rev() {
+                    let lower = intro.to_lowercase();
+                    let colon = intro.ends_with([':', '：']);
+                    if ends_with_question(intro) || (colon && CHOICE_CUES.iter().any(|c| lower.contains(c))) {
+                        return Some(intro.clone());
+                    }
+                }
+            }
+        }
+        tail[tail.len().saturating_sub(3)..]
+            .iter()
+            .rev()
+            .find(|l| {
+                let lower = l.to_lowercase();
+                ASK_PHRASES.iter().any(|p| contains_phrase(&lower, p))
+            })
+            .cloned()
+    })()?;
+    Some(truncate(&redact(&found), MAX_DETAIL_CHARS))
+}
+
+/// Substring match; ASCII phrases must also sit on word boundaries, so
+/// "should i" does not match "should include".
+fn contains_phrase(hay: &str, phrase: &str) -> bool {
+    if !phrase.is_ascii() {
+        return hay.contains(phrase);
+    }
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() && c.is_ascii());
+    hay.match_indices(phrase).any(|(i, m)| !word(hay[..i].chars().next_back()) && !word(hay[i + m.len()..].chars().next()))
+}
+
 /// Updates `st` for `input` and returns the event to push, if any.
 pub fn plan(input: &HookInput, st: &mut SessionState, ctx: &Context) -> Option<Payload> {
     let k = kind(&input.hook_event_name);
@@ -300,12 +451,29 @@ pub fn plan(input: &HookInput, st: &mut SessionState, ctx: &Context) -> Option<P
             Some(p)
         }
         Kind::Stop => {
-            let mut p = base(AgentState::AllSet, "all set.", st);
-            if let Some(start) = st.started_at {
-                let d = ctx.now.saturating_sub(start);
-                p.duration_ms = Some(d);
-                p.detail = Some(format!("took {}", fmt_duration(d)));
-            }
+            let took = st.started_at.map(|start| ctx.now.saturating_sub(start));
+            let question = ctx.final_text.as_deref().and_then(classify_turn_end);
+            let (running, waiting) = ctx.workflows.unwrap_or((0, 0));
+            let mut p = match question {
+                Some(q) => {
+                    let mut p = base(AgentState::YourTurn, "your turn.", st);
+                    p.detail = Some(q);
+                    p
+                }
+                None if waiting > 0 => {
+                    let mut p = base(AgentState::YourTurn, "your turn.", st);
+                    p.detail = Some(format!("{waiting} wf waiting"));
+                    p
+                }
+                None => {
+                    let mut p = base(AgentState::AllSet, "all set.", st);
+                    p.detail = took.map(|d| format!("took {}", fmt_duration(d)));
+                    p
+                }
+            };
+            p.duration_ms = took;
+            p.workflows_running = (running > 0).then_some(running);
+            p.workflows_waiting = (waiting > 0).then_some(waiting);
             st.started_at = None;
             st.last_tool = None;
             st.last_push_ms = ctx.now;
@@ -461,6 +629,36 @@ fn read_input() -> Option<HookInput> {
     }
 }
 
+/// The `[hook]` section of config.toml, read leniently: unknown keys and other
+/// sections are ignored, and any error yields the defaults.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct HookConfig {
+    pub include_subagents: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct HookConfigFile {
+    hook: HookConfig,
+}
+
+pub fn parse_hook_config(text: &str) -> HookConfig {
+    toml::from_str::<HookConfigFile>(text).map(|f| f.hook).unwrap_or_default()
+}
+
+/// `$NEARPUSH_CONFIG_DIR/config.toml`, else `~/.config/nearpush/config.toml`.
+fn hook_config() -> HookConfig {
+    let path = match std::env::var_os("NEARPUSH_CONFIG_DIR") {
+        Some(d) => PathBuf::from(d).join("config.toml"),
+        None => match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h).join(".config/nearpush/config.toml"),
+            None => return HookConfig::default(),
+        },
+    };
+    fs::read_to_string(path).map(|t| parse_hook_config(&t)).unwrap_or_default()
+}
+
 /// Entry point. Never panics outward, never prints to stdout, always returns.
 pub async fn run(addr: &str, token_file: Option<PathBuf>) {
     if disabled() {
@@ -482,12 +680,36 @@ pub async fn run(addr: &str, token_file: Option<PathBuf>) {
         fallback_session: ["KIRO_SESSION_ID", "TERM_SESSION_ID"]
             .iter()
             .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty())),
+        ..Default::default()
     };
     let Some(dir) = state_dir() else { return };
-    let path = state_file(&dir, &session_id(&input, &ctx));
+    let session = session_id(&input, &ctx);
+    let kiro_dir = crate::kiro::sessions_root().and_then(|root| crate::kiro::find_session_dir(&root, &session));
+    let subagent = kiro_dir
+        .as_deref()
+        .and_then(crate::kiro::read_session_json)
+        .is_some_and(|s| crate::kiro::is_subagent(&s, &session));
+    if subagent && !hook_config().include_subagents {
+        return;
+    }
+    let path = state_file(&dir, &session);
     if k == Kind::SessionEnd {
         let _ = fs::remove_file(&path);
         return;
+    }
+    let mut ctx = ctx;
+    if k == Kind::Stop {
+        ctx.final_text = [&input.response, &input.assistant_response, &input.last_assistant_message]
+            .into_iter()
+            .flatten()
+            .find(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| kiro_dir.as_deref().and_then(|d| crate::kiro::last_assistant_text(&d.join("messages.jsonl"))));
+        let deadline = std::time::Instant::now() + crate::kiro::WORKFLOW_SCAN_BUDGET;
+        ctx.workflows = kiro_dir
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(|ws| crate::kiro::workflow_counts(&ws.join("workflows"), &session, std::time::SystemTime::now(), deadline));
     }
     if matches!(k, Kind::SessionStart | Kind::PromptSubmit) {
         prune(&dir.join("hooks"), ctx.now);
@@ -678,6 +900,96 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         fs::write(wt.path().join(".git"), format!("gitdir: {}\n", dir.path().join(".git").display())).unwrap();
         assert_eq!(git_branch(wt.path()).as_deref(), Some("feat/x"));
+    }
+
+    fn your_turn(text: &str) -> String {
+        classify_turn_end(text).unwrap_or_else(|| panic!("expected your_turn: {text:?}"))
+    }
+
+    fn all_set(text: &str) {
+        assert_eq!(classify_turn_end(text), None, "expected all_set: {text:?}");
+    }
+
+    #[test]
+    fn classifier_zh_tw() {
+        assert_eq!(your_turn("已改好 hook。\n\n要不要我順便把 README 也更新？"), "要不要我順便把 README 也更新？");
+        assert_eq!(your_turn("目前有兩個方案：\n1. 用 SMAppService\n2. 用子程序\n請選一個"), "目前有兩個方案：");
+        assert_eq!(your_turn("這樣可以嗎"), "這樣可以嗎");
+        assert_eq!(your_turn("你決定要用哪一個方案：\n1. A\n2. B"), "你決定要用哪一個方案：");
+        assert_eq!(your_turn("**要繼續部署嗎？**"), "要繼續部署嗎？");
+        all_set("已完成，測試全部通過。");
+        all_set("變更：\n1. 新增 /status\n2. 新增測試");
+        all_set("");
+    }
+
+    #[test]
+    fn classifier_en() {
+        assert_eq!(your_turn("Should I also bump the version?"), "Should I also bump the version?");
+        assert_eq!(your_turn("Options:\n1. Keep it\n2. Remove it"), "Options:");
+        assert_eq!(your_turn("Pushed the fix.\nLet me know which one you prefer."), "Let me know which one you prefer.");
+        assert_eq!(your_turn("Your call — merge now or wait"), "Your call — merge now or wait");
+        assert_eq!(your_turn("Which do you want?\n\nA) rebase\nB) merge"), "Which do you want?");
+        assert_eq!(your_turn("- Proceed with the migration (y/n)?"), "Proceed with the migration (y/n)?");
+        all_set("Done. All 65 tests pass.");
+        all_set("Summary:\n1. Added X\n2. Fixed Y");
+        all_set("Ran it:\n```sh\nread -p 'continue?' x\n```\nAll green.");
+        all_set("The tests should include the edge case, and they do now.");
+        all_set("Is it fast? Yes.\nIt finished in 2s.");
+    }
+
+    #[test]
+    fn classifier_detail_redacted_truncated() {
+        let q = your_turn(&format!("Should I push with GITHUB_TOKEN=ghp_abcdefghijklmnop1234 and then {}?", "word ".repeat(30)));
+        assert!(q.contains("GITHUB_TOKEN=…"), "{q}");
+        assert!(!q.contains("ghp_"), "{q}");
+        assert!(q.chars().count() <= MAX_DETAIL_CHARS, "{q}");
+    }
+
+    fn stop_with(text: Option<&str>, workflows: Option<(u32, u32)>) -> Payload {
+        let mut st = SessionState { started_at: Some(1_000), ..Default::default() };
+        let c = Context { final_text: text.map(str::to_string), workflows, ..ctx(1_000 + 3 * 60_000) };
+        plan(&input(json!({ "hook_event_name": "Stop", "cwd": "/r/x", "session_id": "s" })), &mut st, &c).unwrap()
+    }
+
+    #[test]
+    fn stop_with_question_is_your_turn() {
+        let p = stop_with(Some("I finished the refactor.\n要不要我也更新文件？"), None);
+        assert_eq!(p.state, Some(AgentState::YourTurn));
+        assert_eq!(p.title, "your turn.");
+        assert_eq!(p.detail.as_deref(), Some("要不要我也更新文件？"));
+        assert_eq!(p.duration_ms, Some(3 * 60_000), "duration kept");
+        assert_eq!(serde_json::to_value(&p).unwrap()["state"], "your_turn");
+    }
+
+    #[test]
+    fn stop_with_summary_is_all_set() {
+        let p = stop_with(Some("Done. All tests pass."), Some((0, 0)));
+        assert_eq!(p.state, Some(AgentState::AllSet));
+        assert_eq!(p.detail.as_deref(), Some("took 3m"));
+        assert_eq!(p.duration_ms, Some(3 * 60_000));
+        assert!(p.workflows_running.is_none() && p.workflows_waiting.is_none());
+    }
+
+    #[test]
+    fn stop_with_waiting_workflow_is_your_turn() {
+        let p = stop_with(Some("Started the workflow."), Some((2, 1)));
+        assert_eq!(p.state, Some(AgentState::YourTurn));
+        assert_eq!(p.detail.as_deref(), Some("1 wf waiting"));
+        assert_eq!((p.workflows_running, p.workflows_waiting), (Some(2), Some(1)));
+        let p = stop_with(Some("Started the workflow."), Some((2, 0)));
+        assert_eq!(p.state, Some(AgentState::AllSet));
+        assert_eq!(p.workflows_running, Some(2));
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["workflows_running"], 2);
+        assert!(json.get("workflows_waiting").is_none());
+    }
+
+    #[test]
+    fn hook_config_is_lenient() {
+        assert!(!parse_hook_config("").include_subagents);
+        assert!(parse_hook_config("listen = \"127.0.0.1:1\"\n[hook]\ninclude_subagents = true\n[summarizer]\nenabled = false").include_subagents);
+        assert!(!parse_hook_config("[hook]\ninclude_subagents = \"yes\"").include_subagents);
+        assert!(!parse_hook_config("not toml [[[").include_subagents);
     }
 
     #[test]
