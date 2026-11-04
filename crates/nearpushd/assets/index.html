@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="nearpush">
+<meta name="format-detection" content="telephone=no">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<title>nearpush</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #f5f5f7;
+    --dim: #8e8e93;
+    --faint: #3a3a3c;
+    --red: #ff453a;
+    --green: #30d158;
+    --amber: #ffd60a;
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue",
+            "PingFang TC", "PingFang SC", "PingFang HK", "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+            "Noto Sans CJK TC", "Noto Sans CJK SC", "Microsoft JhengHei", sans-serif;
+    --pad-t: max(14px, env(safe-area-inset-top));
+    --pad-b: max(14px, env(safe-area-inset-bottom));
+    --pad-l: max(18px, env(safe-area-inset-left));
+    --pad-r: max(18px, env(safe-area-inset-right));
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
+    font-family: var(--font); -webkit-font-smoothing: antialiased;
+    -webkit-text-size-adjust: 100%; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  body { position: fixed; inset: 0; }
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+
+  #card {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    padding: var(--pad-t) var(--pad-r) var(--pad-b) var(--pad-l);
+    height: 100vh; height: 100dvh;
+  }
+  #top { display: flex; align-items: center; gap: 10px; min-height: 28px; flex: none; }
+  #meta { flex: 1; font-size: clamp(14px, 4vmin, 22px); color: var(--dim); font-variant-numeric: tabular-nums;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--amber); flex: none; transition: background .3s; }
+  #dot.live { background: var(--green); }
+  #dot.offline { background: var(--red); }
+  #histbtn { display: flex; flex-direction: column; gap: 4px; padding: 8px 2px 8px 10px; flex: none; }
+  #histbtn i { display: block; width: 18px; height: 2px; background: var(--dim); border-radius: 1px; }
+
+  #headline {
+    flex: 1 1 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: center;
+    font-weight: 800; line-height: .98; letter-spacing: -0.035em; font-size: 80px;
+  }
+  #headline .line { display: block; white-space: nowrap; }
+  #headline.wrap .line { white-space: normal; letter-spacing: -0.02em; line-height: 1.08; }
+  .c-red { color: var(--red); } .c-green { color: var(--green); } .c-white { color: var(--fg); }
+  .c-dim { color: var(--dim); } .c-amber { color: var(--amber); }
+  .ast { display: inline-block; width: .5em; height: .5em; margin-left: .08em; vertical-align: .55em;
+         animation: pulse 2.4s ease-in-out infinite; transform-origin: 50% 50%; }
+  .ast svg { width: 100%; height: 100%; display: block; fill: currentColor; }
+  @keyframes pulse {
+    0%   { transform: rotate(0deg) scale(.82); opacity: .55; }
+    50%  { transform: rotate(30deg) scale(1.06); opacity: 1; }
+    100% { transform: rotate(60deg) scale(.82); opacity: .55; }
+  }
+  .working .ast { animation-duration: 1.2s; }
+
+  #lower { flex: none; padding-top: 10px; }
+  #subtitle { font-size: clamp(15px, 4.6vmin, 30px); color: var(--dim); line-height: 1.25;
+              display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  #task { font-size: clamp(17px, 5.6vmin, 36px); font-weight: 600; line-height: 1.25; margin-top: 4px;
+          display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  #subtitle:empty, #task:empty { display: none; }
+  #foot { flex: none; display: flex; align-items: baseline; gap: 12px; padding-top: 12px;
+          font-size: clamp(13px, 3.6vmin, 20px); color: var(--dim); }
+  #project { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #when { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #back { display: none; color: var(--fg); background: var(--faint); border-radius: 999px; padding: 3px 10px; }
+  body.pinned #back { display: inline-block; }
+  #card.fresh #headline, #card.fresh #lower { animation: arrive .45s ease-out; }
+  @keyframes arrive { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  #card.link { cursor: pointer; }
+
+  /* landscape: headline left, details right, when there is room */
+  @media (orientation: landscape) and (min-aspect-ratio: 3/2) {
+    #card { display: grid; grid-template-columns: 1.35fr 1fr; grid-template-rows: auto minmax(0, 1fr) auto;
+            column-gap: 24px; }
+    #top { grid-column: 1 / 3; }
+    #headline { grid-column: 1; grid-row: 2; }
+    #lower { grid-column: 2; grid-row: 2; align-self: center; padding-top: 0; }
+    #subtitle, #task { -webkit-line-clamp: 4; }
+    #foot { grid-column: 1 / 3; grid-row: 3; }
+  }
+
+  #drawer {
+    position: absolute; left: 0; right: 0; bottom: 0; max-height: 78%; display: flex; flex-direction: column;
+    background: #111113; border-radius: 18px 18px 0 0; transform: translateY(105%);
+    transition: transform .28s ease; padding-bottom: var(--pad-b); z-index: 2;
+  }
+  body.drawer #drawer { transform: none; }
+  #shade { position: absolute; inset: 0; background: rgba(0,0,0,.55); opacity: 0; pointer-events: none;
+           transition: opacity .28s; z-index: 1; }
+  body.drawer #shade { opacity: 1; pointer-events: auto; }
+  #drawer header { display: flex; align-items: center; padding: 10px var(--pad-r) 8px var(--pad-l); gap: 10px; flex: none; }
+  #drawer header .grab { position: absolute; left: 50%; top: 6px; width: 36px; height: 4px; margin-left: -18px;
+                         border-radius: 2px; background: var(--faint); }
+  #drawer h2 { margin: 0; font-size: 17px; flex: 1; padding-top: 6px; }
+  #conninfo { font-size: 12px; color: var(--dim); padding-top: 6px; text-align: right; }
+  #list { list-style: none; margin: 0; padding: 0 0 8px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+          overscroll-behavior: contain; }
+  #list li { display: flex; gap: 10px; align-items: center; padding: 10px var(--pad-r) 10px var(--pad-l);
+             border-top: 1px solid #1f1f22; }
+  #list li .d { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--dim); }
+  #list li .t { flex: 1; min-width: 0; }
+  #list li .k { font-size: 12px; color: var(--dim); }
+  #list li .n { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #list li .w { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; flex: none; }
+  #list li.cur { background: #1c1c1f; }
+  #list .empty { color: var(--dim); justify-content: center; }
+  .bg-red { background: var(--red) !important; } .bg-green { background: var(--green) !important; }
+  .bg-white { background: var(--fg) !important; } .bg-amber { background: var(--amber) !important; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ast { animation: none; }
+    #card.fresh #headline, #card.fresh #lower { animation: none; }
+  }
+</style>
+</head>
+<body>
+<main id="card" aria-live="polite">
+  <div id="top">
+    <div id="meta"></div>
+    <div id="dot" title="connecting"></div>
+    <button id="histbtn" aria-label="Recent events"><i></i><i></i><i></i></button>
+  </div>
+  <div id="headline"></div>
+  <div id="lower">
+    <div id="subtitle"></div>
+    <div id="task"></div>
+  </div>
+  <div id="foot">
+    <div id="project"></div>
+    <button id="back">latest</button>
+    <div id="when"></div>
+  </div>
+</main>
+<div id="shade"></div>
+<section id="drawer" aria-label="Recent events">
+  <header><span class="grab"></span><h2>Recent</h2><div id="conninfo"></div></header>
+  <ul id="list"></ul>
+</section>
+<script>
+(() => {
+  'use strict';
+  const PAGE_VERSION = '__NEARPUSH_VERSION__';
+  const LS_ID = 'nearpush.lastId', LS_EVENTS = 'nearpush.events', SS_RELOAD = 'nearpush.reloadedFor';
+  const KEEP = 100, STALE_MS = 50000, RESUME_STALE_MS = 25000, BACKOFF_MIN = 1000, BACKOFF_MAX = 30000;
+  const $ = (id) => document.getElementById(id);
+
+  const STATES = {
+    allow:     { lines: [['allow.', 'red']], dot: 'red', label: 'allow' },
+    your_turn: { lines: [['your', 'white'], ['turn.', 'red']], dot: 'red', label: 'your turn' },
+    all_set:   { lines: [['all', 'green'], ['set.', 'green']], dot: 'green', label: 'all set' },
+    working:   { lines: [['working.', 'dim']], dot: 'white', label: 'working' },
+  };
+  const LEVEL_COLOR = { info: 'white', warn: 'amber', error: 'red' };
+  const AST_SVG = '<svg viewBox="-50 -50 100 100" aria-hidden="true">' +
+    [0, 60, 120].map((a) => `<rect x="-7" y="-48" width="14" height="96" rx="3" transform="rotate(${a})"/>`).join('') +
+    '</svg>';
+
+  // ---- state -------------------------------------------------------------
+  let events = loadEvents();          // newest first
+  let lastId = Number(localStorage.getItem(LS_ID)) || 0;
+  if (events.length && events[0].id > lastId) lastId = events[0].id;
+  let ws = null, backoff = BACKOFF_MIN, retryTimer = null, retryAt = 0, lastMsgAt = 0;
+  let clockOffset = 0, pinnedId = null, shownId = undefined, wakeLock = null, renderQueued = false;
+  let status = 'connecting';
+
+  function loadEvents() {
+    try {
+      const v = JSON.parse(localStorage.getItem(LS_EVENTS) || '[]');
+      return Array.isArray(v) ? v.filter((e) => e && typeof e.id === 'number') : [];
+    } catch { return []; }
+  }
+  function save() {
+    try {
+      localStorage.setItem(LS_EVENTS, JSON.stringify(events.slice(0, KEEP)));
+      localStorage.setItem(LS_ID, String(lastId));
+    } catch { /* storage full or disabled: resume falls back to server replay */ }
+  }
+
+  // ---- connection --------------------------------------------------------
+  function setStatus(s) {
+    status = s;
+    const dot = $('dot');
+    dot.className = s === 'live' ? 'live' : s === 'offline' ? 'offline' : '';
+    dot.title = s;
+    updateConnInfo();
+  }
+
+  function connect() {
+    clearTimeout(retryTimer); retryTimer = null;
+    if (ws) {
+      const old = ws; ws = null;
+      old.onopen = old.onmessage = old.onclose = old.onerror = null;
+      try { old.close(); } catch { /* already closed */ }
+    }
+    setStatus('connecting');
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let sock;
+    try { sock = new WebSocket(`${proto}//${location.host}/ws?since=${lastId}`); }
+    catch { scheduleRetry(); return; }
+    ws = sock; lastMsgAt = Date.now();
+    sock.onmessage = (m) => {
+      if (ws !== sock) return;
+      lastMsgAt = Date.now();
+      let f; try { f = JSON.parse(m.data); } catch { return; }
+      onFrame(f);
+    };
+    sock.onclose = () => { if (ws !== sock) return; ws = null; scheduleRetry(); };
+  }
+
+  function scheduleRetry() {
+    if (retryTimer) return;
+    const wait = Math.min(backoff, BACKOFF_MAX) * (0.75 + Math.random() * 0.5);
+    backoff = Math.min(backoff * 2, BACKOFF_MAX);
+    retryAt = Date.now() + wait;
+    setStatus('offline');
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, wait);
+  }
+
+  function onFrame(f) {
+    switch (f.type) {
+      case 'hello':
+        if (typeof f.server_time === 'number') clockOffset = f.server_time - Date.now();
+        if (f.version !== PAGE_VERSION) {
+          // Self-update. Guard against a reload loop if a cache keeps serving the old page.
+          if (sessionStorage.getItem(SS_RELOAD) !== f.version) {
+            sessionStorage.setItem(SS_RELOAD, f.version);
+            location.reload();
+            return;
+          }
+        } else {
+          sessionStorage.removeItem(SS_RELOAD);
+        }
+        if (typeof f.last_id === 'number' && f.last_id < lastId) {
+          // Server history was reset: drop the stale cursor and start over.
+          events = []; lastId = 0; pinnedId = null; save(); queueRender();
+          connect();
+          return;
+        }
+        backoff = BACKOFF_MIN;
+        break;
+      case 'event':
+        addEvent(f.event);
+        break;
+      case 'synced':
+        setStatus('live');
+        break;
+      default:
+        break; // 'ping' and future frame types
+    }
+  }
+
+  function addEvent(e) {
+    if (!e || typeof e.id !== 'number' || e.id <= lastId) return;
+    lastId = e.id;
+    events.unshift(e);
+    if (events.length > KEEP) events.length = KEEP;
+    pinnedId = null;
+    save();
+    queueRender();
+  }
+
+  // iOS freezes sockets in the background; on return the socket can look open but be dead.
+  function resume() {
+    if (document.visibilityState !== 'visible') return;
+    backoff = BACKOFF_MIN;
+    const age = Date.now() - lastMsgAt;
+    const healthy = ws && ((ws.readyState === WebSocket.OPEN && age <= RESUME_STALE_MS) ||
+                           (ws.readyState === WebSocket.CONNECTING && age <= 10000));
+    if (!healthy) connect();
+    requestWake();
+    tick();
+  }
+  document.addEventListener('visibilitychange', resume);
+  window.addEventListener('pageshow', resume);
+  window.addEventListener('online', resume);
+  window.addEventListener('focus', resume);
+
+  setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    if (ws && Date.now() - lastMsgAt > STALE_MS) connect();
+    else if (!ws && !retryTimer) connect();
+  }, 5000);
+
+  // ---- screen wake lock ----------------------------------------------------
+  async function requestWake() {
+    if (!('wakeLock' in navigator) || wakeLock || document.visibilityState !== 'visible') { updateConnInfo(); return; }
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; updateConnInfo(); });
+    } catch { wakeLock = null; }
+    updateConnInfo();
+  }
+  // Some iOS versions only grant the lock from a user gesture.
+  document.addEventListener('touchend', () => { if (!wakeLock) requestWake(); }, { passive: true });
+
+  function updateConnInfo() {
+    const wl = !('wakeLock' in navigator) ? 'no wake lock' : wakeLock ? 'screen kept awake' : 'tap to keep awake';
+    let s = status;
+    if (status === 'offline' && retryTimer) s = `offline, retry in ${Math.max(0, Math.ceil((retryAt - Date.now()) / 1000))}s`;
+    $('conninfo').textContent = `${s} · ${wl}`;
+  }
+
+  // ---- rendering -----------------------------------------------------------
+  function fmtDur(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
+  }
+  function timing(e) {
+    if (!e) return '';
+    let d = e.duration_ms;
+    if (d == null && e.state === 'all_set' && e.started_at) d = e.ts - e.started_at;
+    if (d != null && d >= 0) return `took ${fmtDur(d)}`;
+    if (e.started_at) return `${fmtDur(Math.max(0, Date.now() + clockOffset - e.started_at))} so far`;
+    return '';
+  }
+  function clock(ts) {
+    const d = new Date(ts), now = new Date();
+    const hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return d.toDateString() === now.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  }
+  function safeUrl(u) {
+    return typeof u === 'string' && /^https?:\/\//i.test(u) ? u : null;
+  }
+  function spec(e) {
+    if (!e) return { lines: [['waiting.', 'dim']], sub: 'no events yet', task: '', wrap: false, state: 'working' };
+    const st = STATES[e.state];
+    if (st) return { lines: st.lines, sub: e.subtitle || e.body || '', task: e.title, wrap: false, state: e.state };
+    return { lines: [[e.title, LEVEL_COLOR[e.level] || 'white']], sub: e.subtitle || e.body || '', task: '',
+             wrap: true, state: null };
+  }
+  function dotColor(e) {
+    const st = STATES[e.state];
+    return st ? st.dot : (LEVEL_COLOR[e.level] || 'white');
+  }
+
+  function current() {
+    if (pinnedId != null) { const p = events.find((e) => e.id === pinnedId); if (p) return p; pinnedId = null; }
+    return events[0] || null;
+  }
+
+  function queueRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => { renderQueued = false; render(); });
+  }
+
+  function render() {
+    const e = current();
+    const s = spec(e);
+    const card = $('card'), head = $('headline');
+    head.textContent = '';
+    head.className = s.wrap ? 'wrap' : '';
+    card.classList.toggle('working', s.state === 'working');
+    s.lines.forEach(([text, color], i) => {
+      const line = document.createElement('span');
+      line.className = `line c-${color}`;
+      line.textContent = text;
+      if (i === s.lines.length - 1 && !s.wrap) {
+        const ast = document.createElement('span');
+        ast.className = 'ast';
+        ast.innerHTML = AST_SVG; // static markup, no event data
+        line.appendChild(ast);
+      }
+      head.appendChild(line);
+    });
+    $('subtitle').textContent = s.sub;
+    $('task').textContent = s.task;
+    $('project').textContent = (e && e.project) || '';
+    $('when').textContent = e ? clock(e.ts) : '';
+    document.body.classList.toggle('pinned', pinnedId != null);
+    card.classList.toggle('link', !!(e && safeUrl(e.url)));
+    if (e && e.id !== shownId) {
+      card.classList.remove('fresh'); void card.offsetWidth; card.classList.add('fresh');
+    }
+    shownId = e ? e.id : null;
+    tick();
+    fit();
+    renderList();
+  }
+
+  // Largest font size at which the headline still fits its box.
+  function fit() {
+    const el = $('headline');
+    let lo = 12, hi = Math.max(window.innerWidth, window.innerHeight) * 0.7;
+    for (let i = 0; i < 16; i++) {
+      const mid = (lo + hi) / 2;
+      el.style.fontSize = `${mid}px`;
+      if (el.scrollWidth <= el.clientWidth + 1 && el.scrollHeight <= el.clientHeight + 1) lo = mid; else hi = mid;
+    }
+    el.style.fontSize = `${Math.floor(lo)}px`;
+  }
+
+  function renderList() {
+    const list = $('list');
+    list.textContent = '';
+    if (!events.length) {
+      const li = document.createElement('li'); li.className = 'empty'; li.textContent = 'Nothing yet';
+      list.appendChild(li); return;
+    }
+    const cur = current();
+    for (const e of events) {
+      const li = document.createElement('li');
+      if (cur && e.id === cur.id) li.className = 'cur';
+      const d = document.createElement('span'); d.className = `d bg-${dotColor(e)}`;
+      const t = document.createElement('div'); t.className = 't';
+      const k = document.createElement('div'); k.className = 'k';
+      k.textContent = [STATES[e.state] ? STATES[e.state].label : e.level, e.project].filter(Boolean).join(' · ');
+      const n = document.createElement('div'); n.className = 'n'; n.textContent = e.title;
+      t.append(k, n);
+      const w = document.createElement('span'); w.className = 'w'; w.textContent = clock(e.ts);
+      li.append(d, t, w);
+      li.addEventListener('click', () => {
+        pinnedId = e.id === events[0].id ? null : e.id;
+        closeDrawer(); render();
+      });
+      list.appendChild(li);
+    }
+  }
+
+  function tick() {
+    $('meta').textContent = timing(current());
+    if (document.body.classList.contains('drawer')) updateConnInfo();
+  }
+  setInterval(tick, 1000);
+
+  // ---- interaction ---------------------------------------------------------
+  function openDrawer() { renderList(); updateConnInfo(); document.body.classList.add('drawer'); }
+  function closeDrawer() { document.body.classList.remove('drawer'); }
+  $('histbtn').addEventListener('click', (ev) => { ev.stopPropagation(); openDrawer(); });
+  $('shade').addEventListener('click', closeDrawer);
+  $('back').addEventListener('click', (ev) => { ev.stopPropagation(); pinnedId = null; render(); });
+  $('card').addEventListener('click', () => {
+    const e = current(); const u = e && safeUrl(e.url);
+    if (u) window.open(u, '_blank', 'noopener');
+  });
+
+  let touchY = null;
+  document.addEventListener('touchstart', (ev) => { touchY = ev.touches[0].clientY; }, { passive: true });
+  document.addEventListener('touchend', (ev) => {
+    if (touchY == null) return;
+    const dy = ev.changedTouches[0].clientY - touchY; touchY = null;
+    const open = document.body.classList.contains('drawer');
+    if (!open && dy < -50) openDrawer();
+    else if (open && dy > 60 && $('list').scrollTop <= 0) closeDrawer();
+  }, { passive: true });
+  // Keep the main view from scrolling or bouncing; only the drawer list scrolls.
+  document.addEventListener('touchmove', (ev) => {
+    if (!ev.target.closest || !ev.target.closest('#list')) ev.preventDefault();
+  }, { passive: false });
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(fit, 80); });
+  window.addEventListener('orientationchange', () => setTimeout(fit, 250));
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
+
+  render();
+  connect();
+  requestWake();
+})();
+</script>
+</body>
+</html>

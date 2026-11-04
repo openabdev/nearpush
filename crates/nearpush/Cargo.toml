@@ -1,0 +1,17 @@
+[package]
+name = "nearpush"
+description = "CLI that pushes notification events to nearpushd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nearpush"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt", "macros"] }
