@@ -12,6 +12,8 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use nearpushd::assets;
 use nearpushd::config::SummarizerConfig;
+use nearpushd::control::Control;
+use nearpushd::event::AgentState;
 use nearpushd::server::{self, AppState};
 use nearpushd::store::Store;
 use serde_json::{Value, json};
@@ -385,6 +387,8 @@ fn summarizer_state(dir: &Path, script: &str, timeout_secs: u64) -> AppState {
     state(dir, true)
         .with_sessions(nearpushd::sessions::Sessions::load(dir))
         .with_summarizer(cfg, dir.join("summarizer"))
+        // These tests watch `working` cards, which the default filter hides.
+        .with_control(vec![AgentState::Working, AgentState::AllSet], Control::default(), dir.to_path_buf())
 }
 
 /// Next frame that is not a ping, or `None` if nothing arrives within `wait`.
@@ -481,4 +485,232 @@ async fn failing_summarizer_is_not_rerun_on_every_prompt() {
     d.stop().await;
     let n = std::fs::read_to_string(&runs).unwrap_or_default().lines().count();
     assert_eq!(n, 1, "one failed run, then backoff");
+}
+
+// ---- /status, /control, pause and the display filter -------------------------
+
+async fn get_status(d: &Daemon) -> Value {
+    let r = client().get(d.url("/status")).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    r.json().await.unwrap()
+}
+
+async fn post_control(d: &Daemon, body: Value) -> reqwest::Response {
+    client().post(d.url("/control")).bearer_auth(TOKEN).json(&body).send().await.unwrap()
+}
+
+/// Opens a socket and reads up to `synced`; returns the socket and the synced cursor.
+async fn ws_synced(d: &Daemon, since: u64) -> (Ws, Vec<u64>, u64) {
+    let mut ws = open_ws(&d.ws_url(since), &[]).await.unwrap();
+    assert_eq!(next_frame(&mut ws).await["type"], "hello");
+    let mut ids = Vec::new();
+    loop {
+        let f = next_frame(&mut ws).await;
+        match f["type"].as_str().unwrap() {
+            "event" => ids.push(f["event"]["id"].as_u64().unwrap()),
+            "synced" => return (ws, ids, f["last_id"].as_u64().unwrap()),
+            other => panic!("unexpected frame {other}"),
+        }
+    }
+}
+
+const PROXY_HEADERS: [(&str, &str); 3] =
+    [("Tailscale-User-Login", LOGIN), ("Tailscale-User-Name", "Pahud"), ("X-Forwarded-For", "100.64.0.2")];
+
+#[tokio::test]
+async fn status_requires_token_and_loopback() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), true).await;
+    assert_eq!(client().get(d.url("/status")).send().await.unwrap().status(), 401);
+    assert_eq!(client().get(d.url("/status")).bearer_auth("wrong").send().await.unwrap().status(), 401);
+    for (name, value) in PROXY_HEADERS {
+        let r = client().get(d.url("/status")).bearer_auth(TOKEN).header(name, value).send().await.unwrap();
+        assert_eq!(r.status(), 403, "{name}");
+    }
+    let app = server::router(state(dir.path(), true)).layer(MockConnectInfo(SocketAddr::from(([100, 64, 1, 2], 40000))));
+    let req = Request::get("/status").header("authorization", format!("Bearer {TOKEN}")).body(Body::empty()).unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    let s = get_status(&d).await;
+    assert_eq!((s["last_event_id"].as_u64(), s["viewers"].as_u64()), (Some(0), Some(0)));
+    assert_eq!(s["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(s["pid"].as_u64(), Some(std::process::id() as u64));
+    assert!(s["exe"].is_string());
+    assert_eq!(s["paused"], false);
+    assert_eq!(s["filter"], json!({ "states": ["all_set", "your_turn", "allow"], "source": "config" }));
+    assert_eq!(s["summarizer"]["enabled"], false);
+    assert_eq!(s["summarizer"]["healthy"], false);
+    assert!(s["public_url"].is_null());
+
+    push_ok(&d, "first").await;
+    push_ok(&d, "second").await;
+    let (ws, _, _) = ws_synced(&d, 0).await;
+    let s = get_status(&d).await;
+    assert_eq!(s["viewers"], 1);
+    assert_eq!(s["last_event_id"], 2);
+    assert_eq!(s["recent"][0]["title"], "second");
+    assert_eq!(s["recent"][0]["shown"], true);
+    assert_eq!(s["recent"].as_array().unwrap().len(), 2);
+    drop(ws);
+    let mut viewers = 1;
+    for _ in 0..50 {
+        viewers = get_status(&d).await["viewers"].as_u64().unwrap();
+        if viewers == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(viewers, 0, "viewer count drops when the socket closes");
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn status_reports_public_url_and_summarizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = summarizer_state(dir.path(), "cat >/dev/null; echo label", 5).with_public_url(Some("https://lap.ts.net/".into()));
+    let d = Daemon::start_with(st).await;
+    let s = get_status(&d).await;
+    assert_eq!(s["public_url"], "https://lap.ts.net/");
+    assert_eq!(s["summarizer"]["enabled"], true);
+    assert_eq!(s["summarizer"]["healthy"], true, "never failed yet");
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn control_requires_token_and_rejects_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), true).await;
+    let body = json!({ "paused": true });
+    assert_eq!(client().post(d.url("/control")).json(&body).send().await.unwrap().status(), 401);
+    assert_eq!(client().post(d.url("/control")).bearer_auth("wrong").json(&body).send().await.unwrap().status(), 401);
+    for (name, value) in PROXY_HEADERS {
+        let r = client().post(d.url("/control")).bearer_auth(TOKEN).header(name, value).json(&body).send().await.unwrap();
+        assert_eq!(r.status(), 403, "{name}");
+    }
+    let app = server::router(state(dir.path(), true)).layer(MockConnectInfo(SocketAddr::from(([100, 64, 1, 2], 40000))));
+    let req = Request::post("/control")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"paused":true}"#))
+        .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(post_control(&d, json!({})).await.status(), 400);
+    assert_eq!(post_control(&d, json!({ "pausd": true })).await.status(), 400);
+    assert_eq!(get_status(&d).await["paused"], false, "rejected requests change nothing");
+
+    let r = post_control(&d, body).await;
+    assert_eq!(r.status(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["paused"], true);
+    assert_eq!(v["filter"]["source"], "config");
+    assert_eq!(get_status(&d).await["paused"], true);
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn control_states_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), true).await;
+    assert_eq!(post_control(&d, json!({ "states": ["sleeping"] })).await.status(), 400);
+    assert_eq!(post_control(&d, json!({ "states": "working" })).await.status(), 400);
+    assert_eq!(post_control(&d, json!({ "paused": "yes" })).await.status(), 400);
+    let v: Value = post_control(&d, json!({ "states": ["working", "working", "allow"] })).await.json().await.unwrap();
+    assert_eq!(v["filter"], json!({ "states": ["working", "allow"], "source": "control" }), "duplicates dropped");
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn paused_events_are_stored_not_broadcast() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), true).await;
+    let (mut ws, _, _) = ws_synced(&d, 0).await;
+    assert_eq!(post_control(&d, json!({ "paused": true })).await.status(), 200);
+    let muted_id = push_ok(&d, "quiet please").await;
+    assert!(frame_within(&mut ws, Duration::from_millis(1500)).await.is_none(), "paused: nothing broadcast");
+    let log = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+    let line = log.lines().find(|l| l.contains("quiet please")).expect("stored");
+    assert!(line.contains("\"muted\":true"), "{line}");
+    let s = get_status(&d).await;
+    assert_eq!((s["last_event_id"].as_u64(), s["recent"][0]["shown"].as_bool()), (Some(muted_id), Some(false)));
+
+    assert_eq!(post_control(&d, json!({ "paused": false })).await.status(), 200);
+    let id = push_ok(&d, "back on").await;
+    let f = frame_within(&mut ws, Duration::from_secs(5)).await.unwrap();
+    assert_eq!((f["type"].as_str(), f["event"]["id"].as_u64()), (Some("event"), Some(id)));
+    // A new page replaying from 0 never sees the muted event, even after unpausing.
+    let (_ws2, ids, cursor) = ws_synced(&d, 0).await;
+    assert_eq!(ids, vec![id]);
+    assert_eq!(cursor, id);
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn default_filter_hides_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), true).await;
+    let (mut ws, _, _) = ws_synced(&d, 0).await;
+    let r = push(&d, json!({ "title": "working.", "state": "working", "session": "s1" })).await;
+    assert_eq!(r.status(), 200);
+    let working_id = r.json::<Value>().await.unwrap()["id"].as_u64().unwrap();
+    assert!(frame_within(&mut ws, Duration::from_millis(1500)).await.is_none(), "working is filtered");
+    let r = push(&d, json!({ "title": "all set.", "state": "all_set", "session": "s1" })).await;
+    let all_set = r.json::<Value>().await.unwrap()["id"].as_u64().unwrap();
+    let f = frame_within(&mut ws, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(f["event"]["id"].as_u64(), Some(all_set));
+    let r = push(&d, json!({ "title": "build ok", "level": "warn" })).await;
+    let generic = r.json::<Value>().await.unwrap()["id"].as_u64().unwrap();
+    let f = frame_within(&mut ws, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(f["event"]["id"].as_u64(), Some(generic), "generic level events always show");
+    let hidden = push_ok_state(&d, "working").await;
+
+    let s = get_status(&d).await;
+    let recent = s["recent"].as_array().unwrap();
+    assert_eq!(recent[0]["id"].as_u64(), Some(hidden));
+    assert_eq!(recent[0]["shown"], false);
+    let w = recent.iter().find(|e| e["id"].as_u64() == Some(working_id)).unwrap();
+    assert_eq!((w["state"].as_str(), w["shown"].as_bool()), (Some("working"), Some(false)));
+
+    let (_ws2, ids, cursor) = ws_synced(&d, 0).await;
+    assert_eq!(ids, vec![all_set, generic], "replay skips filtered events");
+    assert_eq!(cursor, hidden, "synced.last_id is the newest stored id, hidden or not");
+    d.stop().await;
+}
+
+async fn push_ok_state(d: &Daemon, state: &str) -> u64 {
+    let r = push(d, json!({ "title": "t", "state": state })).await;
+    assert_eq!(r.status(), 200);
+    r.json::<Value>().await.unwrap()["id"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn filter_change_applies_live_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let with_control = |dir: &Path| {
+        state(dir, true).with_control(vec![AgentState::AllSet], Control::load(dir), dir.to_path_buf())
+    };
+    let d = Daemon::start_with(with_control(dir.path())).await;
+    assert_eq!(get_status(&d).await["filter"], json!({ "states": ["all_set"], "source": "config" }));
+    let (mut ws, _, _) = ws_synced(&d, 0).await;
+    push_ok_state(&d, "working").await;
+    assert!(frame_within(&mut ws, Duration::from_millis(1000)).await.is_none());
+
+    let r = post_control(&d, json!({ "states": ["working", "all_set"] })).await;
+    assert_eq!(r.status(), 200);
+    let id = push_ok_state(&d, "working").await;
+    let f = frame_within(&mut ws, Duration::from_secs(5)).await.expect("applies to the open socket");
+    assert_eq!(f["event"]["id"].as_u64(), Some(id));
+    assert_eq!(post_control(&d, json!({ "paused": true })).await.status(), 200);
+    d.stop().await;
+
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("control.json")).unwrap()).unwrap();
+    assert_eq!(saved, json!({ "paused": true, "states": ["working", "all_set"] }));
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(dir.path().join("control.json")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let d = Daemon::start_with(with_control(dir.path())).await;
+    let s = get_status(&d).await;
+    assert_eq!(s["filter"], json!({ "states": ["working", "all_set"], "source": "control" }));
+    assert_eq!(s["paused"], true);
+    d.stop().await;
 }

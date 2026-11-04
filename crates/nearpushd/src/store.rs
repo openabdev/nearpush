@@ -173,6 +173,12 @@ impl Store {
         inner.next_id - 1
     }
 
+    /// The newest `n` buffered events, newest first.
+    pub fn recent(&self, n: usize) -> Vec<Arc<Event>> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.buf.iter().rev().take(n).cloned().collect()
+    }
+
     /// Id of the oldest buffered event, or 0 when the buffer is empty.
     pub fn oldest_id(&self) -> u64 {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -228,6 +234,12 @@ fn compact(path: &Path, buf: &VecDeque<Arc<Event>>) -> io::Result<()> {
 }
 
 impl Subscription {
+    /// Newest event id this subscriber has been handed (replayed or live),
+    /// whether or not it was shown.
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
     /// Waits for the next live events. When this subscriber has fallen behind the
     /// broadcast channel, it resyncs from the ring buffer instead of being dropped.
     /// Returns `None` once the store is gone.
@@ -429,5 +441,18 @@ mod tests {
         assert_eq!(ids, vec![3, 4, 5]);
         let (replay, _, _) = s.subscribe(99);
         assert!(replay.is_empty());
+    }
+
+    #[test]
+    fn recent_is_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), 100, 16).unwrap();
+        assert!(s.recent(5).is_empty());
+        for i in 0..7 {
+            s.push(ev(&format!("e{i}"))).unwrap();
+        }
+        let ids: Vec<u64> = s.recent(5).iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![7, 6, 5, 4, 3]);
+        assert_eq!(s.subscribe(0).2.cursor(), 7);
     }
 }

@@ -98,7 +98,7 @@
   #foot { flex: none; display: flex; align-items: baseline; gap: 12px; padding-top: 12px;
           font-size: clamp(13px, 3.6vmin, 20px); color: var(--dim); }
   #missed { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #when { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #when, #wf { font-variant-numeric: tabular-nums; white-space: nowrap; }
   #back { display: none; color: var(--fg); background: var(--faint); border-radius: 999px; padding: 3px 10px; }
   body.pinned #back { display: inline-block; }
   #card.fresh #headline, #card.fresh #lower { animation: arrive .45s ease-out; }
@@ -169,6 +169,7 @@
   <div id="foot">
     <div id="missed"></div>
     <button id="back">latest</button>
+    <div id="wf"></div>
     <div id="when"></div>
   </div>
 </main>
@@ -294,6 +295,8 @@
         applyLabel(f.session, f.label);
         break;
       case 'synced':
+        // The daemon's cursor includes events it hid (filtered or paused).
+        if (typeof f.last_id === 'number' && f.last_id > lastId) { lastId = f.last_id; save(); }
         setStatus('live');
         break;
       default:
@@ -468,6 +471,8 @@
     $('sub').textContent = s.sub;
     $('detail').textContent = (e && e.detail) || '';
     $('when').textContent = e ? clock(e.ts) : '';
+    const running = (e && e.workflows_running) || 0, waiting = (e && e.workflows_waiting) || 0;
+    $('wf').textContent = [running && `${running} wf running`, waiting && `${waiting} wf waiting`].filter(Boolean).join(' · ');
     document.body.classList.toggle('pinned', pinnedId != null);
     card.classList.toggle('link', !!(e && safeUrl(e.url)));
     if (e && e.id !== shownId) {

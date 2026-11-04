@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::event::AgentState;
+
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 pub const DEFAULT_BUFFER: usize = 500;
 pub const MAX_BUFFER: usize = 10_000;
@@ -58,6 +60,34 @@ pub struct Config {
     pub allow_loopback_without_login: bool,
     /// LLM command that turns a session's prompts into a short purpose label.
     pub summarizer: SummarizerConfig,
+    /// Which agent states the page shows (generic level events always show).
+    pub filter: FilterConfig,
+    /// Read by `nearpush hook`; accepted here so the shared file stays valid.
+    pub hook: HookConfig,
+    /// The page's public URL (shown by `/status`). Unset: derived from tailscale.
+    pub public_url: Option<String>,
+}
+
+/// Default display filter: `working` is off.
+pub const DEFAULT_FILTER_STATES: &[AgentState] = &[AgentState::AllSet, AgentState::YourTurn, AgentState::Allow];
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilterConfig {
+    pub states: Vec<AgentState>,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        FilterConfig { states: DEFAULT_FILTER_STATES.to_vec() }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HookConfig {
+    /// Let workflow-step / sub-agent sessions push too.
+    pub include_subagents: bool,
 }
 
 /// Default summarizer: a non-interactive kiro-cli run on a cheap model with no tools trusted.
@@ -102,6 +132,9 @@ impl Default for Config {
             buffer_size: DEFAULT_BUFFER,
             allow_loopback_without_login: false,
             summarizer: SummarizerConfig::default(),
+            filter: FilterConfig::default(),
+            hook: HookConfig::default(),
+            public_url: None,
         }
     }
 }
@@ -140,6 +173,12 @@ impl Config {
         }
         if self.summarizer.timeout_secs == 0 || self.summarizer.timeout_secs > 300 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "summarizer.timeout_secs must be 1..=300"));
+        }
+        if let Some(u) = &self.public_url {
+            let lower = u.to_ascii_lowercase();
+            if !(lower.starts_with("https://") || lower.starts_with("http://")) || u.len() > 2048 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "public_url must start with http:// or https://"));
+            }
         }
         Ok(())
     }
@@ -203,6 +242,22 @@ pub fn login_from_status_json(json: &str) -> Option<String> {
 /// Asks the local tailscale CLI for this node's login. `None` if tailscale is
 /// missing, not running or logged out.
 pub async fn discover_tailnet_login() -> Option<String> {
+    discover_from_status(login_from_status_json).await
+}
+
+/// This node's MagicDNS name (`Self.DNSName` without the trailing dot).
+pub fn dns_name_from_status_json(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let name = v.get("Self")?.get("DNSName")?.as_str()?.trim_end_matches('.');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// `https://<MagicDNS name>/`, the URL `tailscale serve` publishes on 443.
+pub async fn discover_public_url() -> Option<String> {
+    discover_from_status(dns_name_from_status_json).await.map(|n| format!("https://{n}/"))
+}
+
+async fn discover_from_status(extract: fn(&str) -> Option<String>) -> Option<String> {
     for bin in TAILSCALE_CANDIDATES {
         let out = tokio::process::Command::new(bin)
             .args(["status", "--json"])
@@ -213,8 +268,8 @@ pub async fn discover_tailnet_login() -> Option<String> {
         let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(10), out).await else {
             continue;
         };
-        if let Some(login) = login_from_status_json(&String::from_utf8_lossy(&out.stdout)) {
-            return Some(login);
+        if let Some(v) = extract(&String::from_utf8_lossy(&out.stdout)) {
+            return Some(v);
         }
     }
     None
@@ -223,6 +278,44 @@ pub async fn discover_tailnet_login() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_dns_name_from_status() {
+        let json = r#"{"Self":{"DNSName":"pahuds-macbook-neo.tailb836bb.ts.net."}}"#;
+        assert_eq!(dns_name_from_status_json(json).as_deref(), Some("pahuds-macbook-neo.tailb836bb.ts.net"));
+        assert_eq!(dns_name_from_status_json(r#"{"Self":{"DNSName":""}}"#), None);
+        assert_eq!(dns_name_from_status_json("not json"), None);
+    }
+
+    #[test]
+    fn filter_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.filter.states, vec![AgentState::AllSet, AgentState::YourTurn, AgentState::Allow]);
+        assert!(!cfg.filter.states.contains(&AgentState::Working));
+        let cfg: Config = toml::from_str("[filter]\nstates = [\"working\", \"all_set\"]").unwrap();
+        assert_eq!(cfg.filter.states, vec![AgentState::Working, AgentState::AllSet]);
+        assert!(toml::from_str::<Config>("[filter]\nstates = [\"sleeping\"]").is_err());
+        // Generic level events are not a state, so they cannot be listed (they always show).
+        assert!(toml::from_str::<Config>("[filter]\nstates = [\"info\"]").is_err());
+        assert!(toml::from_str::<Config>("[filter]\nstate = []").is_err());
+    }
+
+    #[test]
+    fn hook_section_accepted() {
+        let cfg: Config = toml::from_str("[hook]\ninclude_subagents = true").unwrap();
+        assert!(cfg.hook.include_subagents);
+        assert!(!Config::default().hook.include_subagents);
+        assert!(toml::from_str::<Config>("[hook]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn public_url_validated() {
+        let cfg: Config = toml::from_str("public_url = \"https://lap.ts.net/\"").unwrap();
+        assert!(cfg.validate().is_ok());
+        let cfg: Config = toml::from_str("public_url = \"javascript:x\"").unwrap();
+        assert!(cfg.validate().is_err());
+        assert_eq!(Config::default().public_url, None);
+    }
 
     #[test]
     fn parses_login_from_status() {

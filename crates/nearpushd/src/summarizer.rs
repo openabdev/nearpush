@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -44,6 +45,28 @@ pub struct Summarizer {
     tx: mpsc::Sender<String>,
 }
 
+/// Times of the last successful and failed run (unix ms, 0 = never), for `/status`.
+#[derive(Debug, Default)]
+pub struct SummarizerHealth {
+    pub last_ok_ms: AtomicU64,
+    pub last_err_ms: AtomicU64,
+}
+
+impl SummarizerHealth {
+    fn ok(&self) {
+        self.last_ok_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    fn err(&self) {
+        self.last_err_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// No failure since the last success (a summarizer that never ran is healthy).
+    pub fn healthy(&self) -> bool {
+        self.last_err_ms.load(Ordering::Relaxed) <= self.last_ok_ms.load(Ordering::Relaxed)
+    }
+}
+
 impl Summarizer {
     /// Starts the worker task. `workdir` is created 0700 and used as the command's cwd.
     pub fn spawn(
@@ -51,9 +74,10 @@ impl Summarizer {
         workdir: PathBuf,
         sessions: Arc<Sessions>,
         updates: broadcast::Sender<SessionUpdate>,
+        health: Arc<SummarizerHealth>,
     ) -> Summarizer {
         let (tx, rx) = mpsc::channel(QUEUE);
-        tokio::spawn(worker(rx, cfg, workdir, sessions, updates));
+        tokio::spawn(worker(rx, cfg, workdir, sessions, updates, health));
         Summarizer { tx }
     }
 
@@ -69,6 +93,7 @@ async fn worker(
     workdir: PathBuf,
     sessions: Arc<Sessions>,
     updates: broadcast::Sender<SessionUpdate>,
+    health: Arc<SummarizerHealth>,
 ) {
     let timeout = Duration::from_secs(cfg.timeout_secs);
     let mut queue: VecDeque<String> = VecDeque::new();
@@ -100,6 +125,7 @@ async fn worker(
                 Err(e) => {
                     tracing::warn!(session, error = %e, "no summarizer key; keeping the provisional label");
                     sessions.note_failure(&session, now_ms());
+                    health.err();
                     continue;
                 }
             }
@@ -109,6 +135,7 @@ async fn worker(
         }) {
             Ok(label) => {
                 tracing::info!(session, label, "session label updated");
+                health.ok();
                 if sessions.set_label(&session, &label, now_ms()) {
                     let _ = updates.send(SessionUpdate { session, label });
                 }
@@ -116,6 +143,7 @@ async fn worker(
             Err(e) => {
                 tracing::warn!(session, error = %e, "summarizer failed; keeping the provisional label");
                 sessions.note_failure(&session, now_ms());
+                health.err();
             }
         }
     }
@@ -393,7 +421,7 @@ mod tests {
         };
         let sessions = Arc::new(Sessions::in_memory());
         let (tx, mut rx) = broadcast::channel(4);
-        let sum = Summarizer::spawn(cfg, dir.path().join("summarizer"), sessions.clone(), tx);
+        let sum = Summarizer::spawn(cfg, dir.path().join("summarizer"), sessions.clone(), tx, Arc::default());
         assert!(sessions.record_prompt("s1", "fix the login redirect", now_ms()));
         sum.request("s1");
         let upd = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.ok().and_then(Result::ok);

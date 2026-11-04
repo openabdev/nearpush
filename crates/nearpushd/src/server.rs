@@ -1,7 +1,15 @@
-//! HTTP routes: `POST /push`, `GET /ws`, `GET /icons/<sender>` and the embedded page.
+//! HTTP routes: `POST /push`, `GET /status`, `POST /control`, `GET /ws`,
+//! `GET /icons/<sender>` and the embedded page.
+//!
+//! Display rules: an event reaches the page only when it is not `muted` (pushed
+//! while paused) and is either a generic event (no state) or its state is in the
+//! current filter. Hidden events are stored and listed in `/status`, but skipped
+//! in both the replay and the live stream, so the main card and the history
+//! drawer never show them.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -21,17 +29,49 @@ use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 
 use crate::assets;
-use crate::config::SummarizerConfig;
-use crate::event::{Event, NewEvent};
+use crate::config::{DEFAULT_FILTER_STATES, SummarizerConfig};
+use crate::control::Control;
+use crate::event::{AgentState, Event, NewEvent};
 use crate::sessions::{SessionUpdate, Sessions};
 use crate::store::{Store, now_ms};
-use crate::summarizer::Summarizer;
+use crate::summarizer::{Summarizer, SummarizerHealth};
 
 /// Largest accepted `POST /push` body.
 pub const MAX_PUSH_BYTES: usize = 16 * 1024;
 pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Events listed in `GET /status`.
+pub const STATUS_RECENT: usize = 5;
 
 pub const LOGIN_HEADER: &str = "tailscale-user-login";
+
+/// Where the effective display filter comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterSource {
+    /// `[filter] states` in config.toml (or its default).
+    Config,
+    /// Set through `POST /control`, kept in control.json.
+    Control,
+}
+
+/// Pause flag and display filter, changed live by `POST /control`.
+#[derive(Debug, Clone)]
+pub struct ControlState {
+    pub paused: bool,
+    pub states: Vec<AgentState>,
+    pub source: FilterSource,
+    /// Where control.json is written; `None` keeps changes in memory only.
+    pub state_dir: Option<PathBuf>,
+}
+
+impl ControlState {
+    fn persisted(&self) -> Control {
+        Control {
+            paused: self.paused,
+            states: (self.source == FilterSource::Control).then(|| self.states.clone()),
+        }
+    }
+}
 
 /// Shared state behind every route.
 #[derive(Clone)]
@@ -50,6 +90,16 @@ pub struct AppState {
     pub summarizer: Option<Summarizer>,
     /// User icon overrides (`~/.config/nearpush/icons`).
     pub icons_dir: Option<PathBuf>,
+    /// Pause flag and display filter.
+    pub control: Arc<RwLock<ControlState>>,
+    /// Open WebSocket connections.
+    pub viewers: Arc<AtomicUsize>,
+    pub started_at_ms: u64,
+    /// The page's public URL, from config or tailscale discovery.
+    pub public_url: Arc<RwLock<Option<String>>>,
+    pub summarizer_health: Arc<SummarizerHealth>,
+    /// Serializes `POST /control` updates.
+    control_write: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -64,6 +114,17 @@ impl AppState {
             updates: broadcast::channel(64).0,
             summarizer: None,
             icons_dir: None,
+            control: Arc::new(RwLock::new(ControlState {
+                paused: false,
+                states: DEFAULT_FILTER_STATES.to_vec(),
+                source: FilterSource::Config,
+                state_dir: None,
+            })),
+            viewers: Arc::new(AtomicUsize::new(0)),
+            started_at_ms: now_ms(),
+            public_url: Arc::new(RwLock::new(None)),
+            summarizer_health: Arc::new(SummarizerHealth::default()),
+            control_write: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -75,7 +136,13 @@ impl AppState {
     /// Starts the summarizer worker (needs a Tokio runtime). `workdir` is its cwd.
     pub fn with_summarizer(mut self, cfg: SummarizerConfig, workdir: PathBuf) -> Self {
         if cfg.enabled {
-            self.summarizer = Some(Summarizer::spawn(cfg, workdir, self.sessions.clone(), self.updates.clone()));
+            self.summarizer = Some(Summarizer::spawn(
+                cfg,
+                workdir,
+                self.sessions.clone(),
+                self.updates.clone(),
+                self.summarizer_health.clone(),
+            ));
         }
         self
     }
@@ -84,11 +151,43 @@ impl AppState {
         self.icons_dir = Some(dir);
         self
     }
+
+    /// Effective controls: `control` (from control.json) over `config_states`
+    /// (`[filter] states`). Later `/control` changes are saved in `state_dir`.
+    pub fn with_control(self, config_states: Vec<AgentState>, control: Control, state_dir: PathBuf) -> Self {
+        {
+            let mut c = self.control.write().unwrap_or_else(|p| p.into_inner());
+            c.paused = control.paused;
+            match control.states {
+                Some(states) => {
+                    c.states = states;
+                    c.source = FilterSource::Control;
+                }
+                None => {
+                    c.states = config_states;
+                    c.source = FilterSource::Config;
+                }
+            }
+            c.state_dir = Some(state_dir);
+        }
+        self
+    }
+
+    pub fn with_public_url(self, url: Option<String>) -> Self {
+        *self.public_url.write().unwrap_or_else(|p| p.into_inner()) = url;
+        self
+    }
+
+    fn controls(&self) -> ControlState {
+        self.control.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/push", post(push))
+        .route("/status", get(status))
+        .route("/control", post(control))
         .route("/ws", get(ws))
         .route("/", get(index))
         .route("/manifest.webmanifest", get(manifest))
@@ -131,13 +230,15 @@ fn is_proxied(headers: &HeaderMap) -> bool {
     })
 }
 
-/// `POST /push` authorisation: direct loopback peer, no proxy headers, valid token.
-pub fn authorize_push(peer: SocketAddr, headers: &HeaderMap, token: &str) -> Result<(), ApiError> {
+/// Authorisation for `/push`, `/status` and `/control`: direct loopback peer, no
+/// proxy headers, valid token. tailscale serve always adds `Tailscale-*` /
+/// `X-Forwarded-For`, so these routes are unreachable from the tailnet.
+pub fn authorize_local(peer: SocketAddr, headers: &HeaderMap, token: &str) -> Result<(), ApiError> {
     if !peer.ip().is_loopback() {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "push is only accepted from loopback"));
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "only accepted from loopback"));
     }
     if is_proxied(headers) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "push is not accepted through a proxy"));
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "not accepted through a proxy"));
     }
     let presented = headers
         .get(header::AUTHORIZATION)
@@ -149,6 +250,11 @@ pub fn authorize_push(peer: SocketAddr, headers: &HeaderMap, token: &str) -> Res
         Some(_) => Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid token")),
         None => Err(ApiError::new(StatusCode::UNAUTHORIZED, "missing bearer token")),
     }
+}
+
+/// `POST /push` authorisation; see [`authorize_local`].
+pub fn authorize_push(peer: SocketAddr, headers: &HeaderMap, token: &str) -> Result<(), ApiError> {
+    authorize_local(peer, headers, token)
 }
 
 /// Page and socket authorisation: loopback peer with an allowlisted
@@ -213,6 +319,8 @@ async fn push(
     let new: NewEvent = serde_json::from_slice(&body)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid payload: {e}")))?;
     let mut new = new.validate(now_ms()).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    // Paused (DND): stored and marked muted, never broadcast or replayed.
+    new.muted = state.control.read().unwrap_or_else(|p| p.into_inner()).paused;
     // The prompt only feeds the summarizer; it is never stored with the event, and
     // it is not recorded at all when the summarizer is off.
     let prompt = new.prompt.take().filter(|_| state.summarizer.is_some());
@@ -242,8 +350,173 @@ async fn push(
             sum.request(s);
         }
     }
-    tracing::info!(id = ev.id, title = %ev.title, "event accepted");
+    tracing::info!(id = ev.id, title = %ev.title, muted = ev.muted, "event accepted");
     Ok(Json(PushResponse { id: ev.id, ts: ev.ts }))
+}
+
+#[derive(Serialize)]
+struct FilterView {
+    states: Vec<AgentState>,
+    source: FilterSource,
+}
+
+#[derive(Serialize)]
+struct ControlView {
+    paused: bool,
+    filter: FilterView,
+}
+
+impl From<&ControlState> for ControlView {
+    fn from(c: &ControlState) -> Self {
+        ControlView { paused: c.paused, filter: FilterView { states: c.states.clone(), source: c.source } }
+    }
+}
+
+#[derive(Serialize)]
+struct SummarizerView {
+    enabled: bool,
+    healthy: bool,
+    last_ok_ms: u64,
+    last_error_ms: u64,
+}
+
+#[derive(Serialize)]
+struct RecentView<'a> {
+    id: u64,
+    ts: u64,
+    title: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<AgentState>,
+    level: crate::event::Level,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_label: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+    /// Whether the page showed it (false: filtered out or muted).
+    shown: bool,
+}
+
+#[derive(Serialize)]
+struct StatusView<'a> {
+    version: &'static str,
+    ui_version: &'static str,
+    pid: u32,
+    exe: Option<String>,
+    started_at_ms: u64,
+    uptime_secs: u64,
+    viewers: usize,
+    last_event_id: u64,
+    paused: bool,
+    filter: FilterView,
+    summarizer: SummarizerView,
+    public_url: Option<String>,
+    recent: Vec<RecentView<'a>>,
+}
+
+/// `GET /status`: loopback + token, for the menu bar app.
+async fn status(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_local(peer, &headers, &state.token)?;
+    let c = state.controls();
+    let recent = state.store.recent(STATUS_RECENT);
+    let now = now_ms();
+    let enabled = state.summarizer.is_some();
+    let h = &state.summarizer_health;
+    let body = StatusView {
+        version: env!("CARGO_PKG_VERSION"),
+        ui_version: assets::ui_version(),
+        pid: std::process::id(),
+        exe: std::env::current_exe().ok().map(|p| p.display().to_string()),
+        started_at_ms: state.started_at_ms,
+        uptime_secs: now.saturating_sub(state.started_at_ms) / 1000,
+        viewers: state.viewers.load(Ordering::Relaxed),
+        last_event_id: state.store.last_id(),
+        paused: c.paused,
+        summarizer: SummarizerView {
+            enabled,
+            healthy: enabled && h.healthy(),
+            last_ok_ms: h.last_ok_ms.load(Ordering::Relaxed),
+            last_error_ms: h.last_err_ms.load(Ordering::Relaxed),
+        },
+        public_url: state.public_url.read().unwrap_or_else(|p| p.into_inner()).clone(),
+        recent: recent
+            .iter()
+            .map(|e| RecentView {
+                id: e.id,
+                ts: e.ts,
+                title: &e.title,
+                state: e.state,
+                level: e.level,
+                session: e.session.as_deref(),
+                session_label: e.session_label.as_deref(),
+                project: e.project.as_deref(),
+                detail: e.detail.as_deref(),
+                shown: e.visible(&c.states),
+            })
+            .collect(),
+        filter: FilterView { states: c.states, source: c.source },
+    };
+    Ok(Json(body).into_response())
+}
+
+/// Body of `POST /control`; at least one field is required.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlRequest {
+    #[serde(default)]
+    paused: Option<bool>,
+    #[serde(default)]
+    states: Option<Vec<AgentState>>,
+}
+
+/// `POST /control`: loopback + token. Changes apply to open sockets at once and
+/// are saved to control.json before they take effect.
+async fn control(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ControlView>, ApiError> {
+    authorize_local(peer, &headers, &state.token)?;
+    let req: ControlRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid payload: {e}")))?;
+    if req.paused.is_none() && req.states.is_none() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "set paused and/or states"));
+    }
+    // One /control at a time, so read-modify-write and the file save cannot interleave.
+    let _serial = state.control_write.lock().await;
+    let mut next = state.controls();
+    if let Some(p) = req.paused {
+        next.paused = p;
+    }
+    if let Some(mut s) = req.states {
+        let mut seen = Vec::with_capacity(s.len());
+        s.retain(|x| {
+            let new = !seen.contains(x);
+            seen.push(*x);
+            new
+        });
+        next.states = s;
+        next.source = FilterSource::Control;
+    }
+    if let Some(dir) = next.state_dir.clone() {
+        let persisted = next.persisted();
+        tokio::task::spawn_blocking(move || persisted.save(&dir))
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save control.json: {e}")))?;
+    }
+    let view = ControlView::from(&next);
+    tracing::info!(paused = next.paused, states = ?next.states, "controls changed");
+    *state.control.write().unwrap_or_else(|p| p.into_inner()) = next;
+    Ok(Json(view))
 }
 
 fn page_headers(content_type: &'static str, cache: &'static str) -> [(header::HeaderName, HeaderValue); 5] {
@@ -345,7 +618,30 @@ async fn ws(
     Ok(upgrade.on_upgrade(move |socket| stream(socket, state, params.since)))
 }
 
+/// Counts an open socket for `/status` while alive.
+struct ViewerGuard(Arc<AtomicUsize>);
+
+impl ViewerGuard {
+    fn new(n: &Arc<AtomicUsize>) -> Self {
+        n.fetch_add(1, Ordering::Relaxed);
+        ViewerGuard(n.clone())
+    }
+}
+
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether the page gets `ev` under the current controls (read per event, so a
+/// `/control` change applies to open sockets at once).
+fn shown(state: &AppState, ev: &Event) -> bool {
+    ev.visible(&state.control.read().unwrap_or_else(|p| p.into_inner()).states)
+}
+
 async fn stream(mut socket: WebSocket, state: AppState, since: u64) {
+    let _viewer = ViewerGuard::new(&state.viewers);
     let store = state.store.clone();
     let mut updates = state.updates.subscribe();
     let (replay, missed, mut sub) = store.subscribe(since);
@@ -361,12 +657,13 @@ async fn stream(mut socket: WebSocket, state: AppState, since: u64) {
     if socket.send(text(&hello)).await.is_err() {
         return;
     }
-    for ev in &replay {
+    for ev in replay.iter().filter(|ev| shown(&state, ev)) {
         if socket.send(text(&Frame::Event { event: ev })).await.is_err() {
             return;
         }
     }
-    let synced = Frame::Synced { last_id: replay.last().map(|e| e.id).unwrap_or(since.min(store.last_id())) };
+    // The newest stored id, shown or not, so hidden ids never count as missed.
+    let synced = Frame::Synced { last_id: sub.cursor() };
     if socket.send(text(&synced)).await.is_err() {
         return;
     }
@@ -380,7 +677,7 @@ async fn stream(mut socket: WebSocket, state: AppState, since: u64) {
                 if batch.missed > 0 && socket.send(text(&Frame::Missed { missed: batch.missed })).await.is_err() {
                     return;
                 }
-                for ev in &batch.events {
+                for ev in batch.events.iter().filter(|ev| shown(&state, ev)) {
                     if socket.send(text(&Frame::Event { event: ev })).await.is_err() {
                         return;
                     }

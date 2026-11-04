@@ -21,6 +21,8 @@ pub const MAX_PROMPT_CHARS: usize = 4000;
 pub const MAX_DURATION_MS: u64 = 30 * 24 * 3600 * 1000;
 /// How far in the future `started_at` may lie (clock skew allowance).
 pub const MAX_FUTURE_SKEW_MS: u64 = 24 * 3600 * 1000;
+/// Largest accepted `workflows_running` / `workflows_waiting`.
+pub const MAX_WORKFLOWS: u32 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +92,14 @@ pub struct NewEvent {
     /// The user's prompt, fed to the session summarizer. Never persisted.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Workflow runs of this session still running / waiting on the user (Stop only).
+    #[serde(default)]
+    pub workflows_running: Option<u32>,
+    #[serde(default)]
+    pub workflows_waiting: Option<u32>,
+    /// Set by the server while paused; clients cannot send it.
+    #[serde(skip)]
+    pub muted: bool,
 }
 
 /// A stored event, as persisted in JSONL and sent to subscribers.
@@ -129,6 +139,21 @@ pub struct Event {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows_running: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows_waiting: Option<u32>,
+    /// Pushed while paused: stored, never broadcast or replayed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
+}
+
+impl Event {
+    /// Whether the page shows this event: not muted, and either a generic event
+    /// (no state) or a state in `states`.
+    pub fn visible(&self, states: &[AgentState]) -> bool {
+        !self.muted && self.state.is_none_or(|s| states.contains(&s))
+    }
 }
 
 /// `[a-z0-9-]`, 1..=32 characters. Also used to resolve `/icons/<sender>`, so it
@@ -223,6 +248,15 @@ impl NewEvent {
         let host = opt_field("host", self.host, MAX_HOST_CHARS)?;
         let detail = opt_field("detail", self.detail, MAX_DETAIL_CHARS)?;
         let prompt = opt_field("prompt", self.prompt, MAX_PROMPT_CHARS)?;
+        let count = |field: &str, v: Option<u32>| -> Result<Option<u32>, String> {
+            match v {
+                Some(n) if n > MAX_WORKFLOWS => Err(format!("{field} exceeds {MAX_WORKFLOWS}")),
+                Some(0) | None => Ok(None),
+                Some(n) => Ok(Some(n)),
+            }
+        };
+        let workflows_running = count("workflows_running", self.workflows_running)?;
+        let workflows_waiting = count("workflows_waiting", self.workflows_waiting)?;
         Ok(NewEvent {
             title,
             body,
@@ -241,6 +275,9 @@ impl NewEvent {
             host,
             detail,
             prompt,
+            workflows_running,
+            workflows_waiting,
+            muted: self.muted,
         })
     }
 
@@ -264,6 +301,9 @@ impl NewEvent {
             session_label: self.session_label,
             host: self.host,
             detail: self.detail,
+            workflows_running: self.workflows_running,
+            workflows_waiting: self.workflows_waiting,
+            muted: self.muted,
         }
     }
 }
@@ -350,5 +390,48 @@ mod tests {
         assert!(serde_json::from_str::<NewEvent>(r#"{"title":"t","state":"sleeping"}"#).is_err());
         let e: NewEvent = serde_json::from_str(r#"{"title":"t","state":"your_turn"}"#).unwrap();
         assert_eq!(e.state, Some(AgentState::YourTurn));
+    }
+
+    #[test]
+    fn muted_cannot_be_set_by_client() {
+        assert!(serde_json::from_str::<NewEvent>(r#"{"title":"t","muted":true}"#).is_err());
+        let mut e = ev("t");
+        e.muted = true;
+        let json = serde_json::to_string(&e.validate(1).unwrap().into_event(1, 1)).unwrap();
+        assert!(json.contains("\"muted\":true"));
+        let json = serde_json::to_string(&ev("t").validate(1).unwrap().into_event(1, 1)).unwrap();
+        assert!(!json.contains("muted"), "unmuted events keep the old line shape");
+    }
+
+    #[test]
+    fn workflow_counts_bounded() {
+        let mut e = ev("t");
+        e.workflows_running = Some(MAX_WORKFLOWS + 1);
+        assert!(e.validate(1).is_err());
+        let mut e = ev("t");
+        e.workflows_running = Some(0);
+        e.workflows_waiting = Some(2);
+        let e = e.validate(1).unwrap().into_event(1, 1);
+        assert_eq!((e.workflows_running, e.workflows_waiting), (None, Some(2)));
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"workflows_waiting\":2") && !json.contains("workflows_running"));
+    }
+
+    #[test]
+    fn visibility_rule() {
+        let defaults = crate::config::DEFAULT_FILTER_STATES;
+        let with = |state: Option<AgentState>, muted: bool| {
+            let mut e = ev("t");
+            e.state = state;
+            e.muted = muted;
+            e.validate(1).unwrap().into_event(1, 1)
+        };
+        assert!(!with(Some(AgentState::Working), false).visible(defaults));
+        assert!(with(Some(AgentState::AllSet), false).visible(defaults));
+        assert!(with(Some(AgentState::YourTurn), false).visible(defaults));
+        assert!(with(None, false).visible(defaults), "generic events always show");
+        assert!(with(None, false).visible(&[]));
+        assert!(!with(Some(AgentState::AllSet), true).visible(defaults), "muted is hidden");
+        assert!(with(Some(AgentState::Working), false).visible(&[AgentState::Working]));
     }
 }
