@@ -85,6 +85,12 @@ public final class DaemonClient: @unchecked Sendable {
 
     public func status() async -> StatusResult {
         guard let token = readToken() else {
+            // Still probe the port: any HTTP answer (401 from a current daemon,
+            // 404 from an older one) means someone else already owns it.
+            let req = URLRequest(url: base.appendingPathComponent("status"))
+            if let (_, resp) = try? await session.data(for: req), resp is HTTPURLResponse {
+                return .external("a daemon answers, but \(tokenURL.path) is missing or empty")
+            }
             return .noToken("\(tokenURL.path) is missing or empty")
         }
         var req = URLRequest(url: base.appendingPathComponent("status"))

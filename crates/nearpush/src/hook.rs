@@ -276,7 +276,7 @@ const CLASSIFY_TAIL_LINES: usize = 8;
 /// Phrases that ask the user for a decision (matched case-insensitively in the
 /// last 3 lines).
 const ASK_PHRASES: &[&str] = &[
-    "請選", "要不要", "你決定", "跟我說", "告訴我", "要我", "是否要", "可以嗎", "好嗎", "選哪", "哪一個",
+    "請選", "要不要", "你決定", "跟我說", "告訴我", "是否要", "可以嗎", "好嗎", "選哪", "哪一個",
     "which option", "should i", "let me know", "your call", "do you want", "would you like", "shall i",
     "want me to", "please confirm",
 ];
@@ -919,6 +919,8 @@ mod tests {
         assert_eq!(your_turn("**要繼續部署嗎？**"), "要繼續部署嗎？");
         all_set("已完成，測試全部通過。");
         all_set("變更：\n1. 新增 /status\n2. 新增測試");
+        all_set("不需要我再做什麼了。");
+        all_set("照你要我的方式改好了。");
         all_set("");
     }
 

@@ -9,12 +9,13 @@ allow_loopback_without_login = false
 # --state always show. Hidden events are still stored (see GET /status) but not
 # broadcast, so neither the main card nor the history drawer shows them.
 # POST /control {"states": [...]} overrides this at runtime (kept in control.json).
-[filter]
-states = ["all_set", "your_turn", "allow"]   # add "working" to see turn starts
+# Requires the menu-bar-era nearpushd: older daemons reject [filter] and [hook].
+# [filter]
+# states = ["all_set", "your_turn", "allow"]   # add "working" to see turn starts
 
 # Read by `nearpush hook`.
-[hook]
-include_subagents = false   # true: workflow-step / sub-agent sessions push too
+# [hook]
+# include_subagents = false   # true: workflow-step / sub-agent sessions push too
 
 [summarizer]
 # Each run is a kiro-cli call billed to your Kiro account that sends the session's
