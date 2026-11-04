@@ -273,8 +273,11 @@ pub fn tool_detail(tool: &str, input: Option<&Value>) -> String {
 /// Lines of the reply's end that the classifier looks at.
 const CLASSIFY_TAIL_LINES: usize = 8;
 
+/// Lines at the end of the reply that the asking phrases are matched against.
+const ASK_TAIL_LINES: usize = 2;
+
 /// Phrases that ask the user for a decision (matched case-insensitively in the
-/// last 3 lines).
+/// last `ASK_TAIL_LINES` lines, quoted text excluded).
 const ASK_PHRASES: &[&str] = &[
     "請選", "要不要", "你決定", "跟我說", "告訴我", "是否要", "可以嗎", "好嗎", "選哪", "哪一個",
     "which option", "should i", "let me know", "your call", "do you want", "would you like", "shall i",
@@ -284,10 +287,10 @@ const ASK_PHRASES: &[&str] = &[
 /// Words that make a `:`-ended intro line a choice prompt.
 const CHOICE_CUES: &[&str] = &["option", "choose", "pick", "which", "選", "方案", "哪"];
 
-/// Strips markdown decoration: bold/code markers, headings, quotes, bullets, and
-/// trailing `*` / `_`.
+/// Strips markdown decoration: bold markers, headings, quotes, bullets, and
+/// trailing `*` / `_`. Backticks stay, so `strip_quoted` can drop code spans.
 fn strip_markdown(line: &str) -> String {
-    let s = line.replace("**", "").replace('`', "");
+    let s = line.replace("**", "");
     let mut s = s.trim();
     loop {
         let before = s;
@@ -302,6 +305,66 @@ fn strip_markdown(line: &str) -> String {
         }
     }
     s.trim_end_matches(['*', '_']).trim_end().to_string()
+}
+
+/// Removes quoted and code spans from one line, keeping the text outside them.
+/// Used only for matching: a phrase that is quoted or mentioned is not a question
+/// to the user. Pairs: 「」 and 『』 (nesting counted), “”, ‘’, "", and backticks.
+/// ASCII `'…'` counts as a quote only when the opener does not follow a letter or
+/// digit and the closer does not precede one, so `don't` and `I'm` stay plain.
+/// An unclosed opener is plain text.
+fn strip_quoted(line: &str) -> String {
+    fn alnum(c: Option<&char>) -> bool {
+        c.is_some_and(|c| c.is_alphanumeric())
+    }
+    fn simple_end(chars: &[char], i: usize, close: char) -> Option<usize> {
+        chars[i + 1..].iter().position(|&c| c == close).map(|j| i + 2 + j)
+    }
+    fn nested_end(chars: &[char], i: usize, open: char, close: char) -> Option<usize> {
+        let mut depth = 0usize;
+        for (j, &c) in chars.iter().enumerate().skip(i) {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+        }
+        None
+    }
+    fn span_end(chars: &[char], i: usize) -> Option<usize> {
+        match chars[i] {
+            '「' => nested_end(chars, i, '「', '」'),
+            '『' => nested_end(chars, i, '『', '』'),
+            '“' => simple_end(chars, i, '”'),
+            '‘' => simple_end(chars, i, '’'),
+            '"' => simple_end(chars, i, '"'),
+            '`' => simple_end(chars, i, '`'),
+            '\'' if i > 0 && alnum(chars.get(i - 1)) => None,
+            '\'' => chars
+                .iter()
+                .enumerate()
+                .skip(i + 1)
+                .find(|&(j, &c)| c == '\'' && !alnum(chars.get(j + 1)))
+                .map(|(j, _)| j + 1),
+            _ => None,
+        }
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match span_end(&chars, i) {
+            Some(end) => i = end,
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 fn ends_with_question(line: &str) -> bool {
@@ -336,15 +399,18 @@ fn is_option_line(line: &str) -> bool {
 /// truncated) for `your_turn`, `None` for `all_set`. Local and fast; never waits
 /// on a model.
 ///
-/// Rules, on the last 8 non-empty lines outside fenced code blocks:
+/// Rules, on the last 8 non-empty lines outside fenced code blocks. Matching uses
+/// each line with quoted and code spans removed, so a quoted or mentioned phrase
+/// is not a question. The returned detail is the line as written.
 /// 1. The last line ends with `?` / `？`.
 /// 2. At least two option lines (`1.`, `A)`, `①`…) in a group whose intro line,
 ///    within 2 lines before it, ends with `?`, or ends with `:` and names a choice
 ///    ("option", "which", "選", "方案", "哪"…). A plain "Changes:\n1. …" stays all_set.
-/// 3. One of the last 3 lines contains an asking phrase ("should I", "let me know",
+/// 3. One of the last 2 lines contains an asking phrase ("should I", "let me know",
 ///    "要不要", "可以嗎"…).
 pub fn classify_turn_end(text: &str) -> Option<String> {
-    let mut lines: Vec<String> = Vec::new();
+    // (as written, quoted and code spans removed)
+    let mut lines: Vec<(String, String)> = Vec::new();
     let mut in_fence = false;
     for raw in text.lines() {
         let t = raw.trim();
@@ -357,38 +423,39 @@ pub fn classify_turn_end(text: &str) -> Option<String> {
         }
         let l = strip_markdown(t);
         if !l.is_empty() {
-            lines.push(l);
+            let matchable = strip_quoted(&l);
+            lines.push((l, matchable));
         }
     }
     let tail = &lines[lines.len().saturating_sub(CLASSIFY_TAIL_LINES)..];
     let found = (|| {
-        let last = tail.last()?;
+        let (last_text, last) = tail.last()?;
         if ends_with_question(last) {
-            return Some(last.clone());
+            return Some(last_text.clone());
         }
-        if let Some(end) = tail.iter().rposition(|l| is_option_line(l)) {
+        if let Some(end) = tail.iter().rposition(|(_, l)| is_option_line(l)) {
             let mut start = end;
-            while start > 0 && is_option_line(&tail[start - 1]) {
+            while start > 0 && is_option_line(&tail[start - 1].1) {
                 start -= 1;
             }
             if end - start + 1 >= 2 {
-                for intro in tail[start.saturating_sub(2)..start].iter().rev() {
+                for (intro_text, intro) in tail[start.saturating_sub(2)..start].iter().rev() {
                     let lower = intro.to_lowercase();
                     let colon = intro.ends_with([':', '：']);
                     if ends_with_question(intro) || (colon && CHOICE_CUES.iter().any(|c| lower.contains(c))) {
-                        return Some(intro.clone());
+                        return Some(intro_text.clone());
                     }
                 }
             }
         }
-        tail[tail.len().saturating_sub(3)..]
+        tail[tail.len().saturating_sub(ASK_TAIL_LINES)..]
             .iter()
             .rev()
-            .find(|l| {
+            .find(|(_, l)| {
                 let lower = l.to_lowercase();
                 ASK_PHRASES.iter().any(|p| contains_phrase(&lower, p))
             })
-            .cloned()
+            .map(|(text, _)| text.clone())
     })()?;
     Some(truncate(&redact(&found), MAX_DETAIL_CHARS))
 }
@@ -945,6 +1012,70 @@ mod tests {
         assert!(q.contains("GITHUB_TOKEN=…"), "{q}");
         assert!(!q.contains("ghp_"), "{q}");
         assert!(q.chars().count() <= MAX_DETAIL_CHARS, "{q}");
+    }
+
+    #[test]
+    fn strip_quoted_removes_quoted_and_code_spans() {
+        assert_eq!(strip_quoted("a「b「c」d」e"), "ae");
+        assert_eq!(strip_quoted("x 'quoted' y"), "x  y");
+        assert_eq!(strip_quoted("say “hi” now"), "say  now");
+        assert_eq!(strip_quoted("`code` text"), " text");
+        assert_eq!(strip_quoted("don't and I'm"), "don't and I'm");
+        assert_eq!(strip_quoted("open 「 never closes"), "open 「 never closes");
+    }
+
+    #[test]
+    fn rules_quoted_ask_phrase_zh_is_all_set() {
+        all_set("前面那則被判成 your turn，原因是句中的「跟我說」命中了規則。\n這次只改了分類方式，其他行為不變。");
+        all_set("『要不要』是引用的詞，不是在問你。\n已經處理完。");
+    }
+
+    #[test]
+    fn rules_negated_yao_wo_zh_is_all_set() {
+        all_set("這次不需要我再確認，已經自動完成。");
+    }
+
+    #[test]
+    fn rules_question_mark_zh_stays_your_turn() {
+        assert_eq!(your_turn("已改好。\n這個結果符合預期？"), "這個結果符合預期？");
+    }
+
+    #[test]
+    fn rules_numbered_choice_zh_without_phrase_stays_your_turn() {
+        assert_eq!(your_turn("目前有兩個方案：\n1. 用 SMAppService\n2. 用子程序"), "目前有兩個方案：");
+    }
+
+    #[test]
+    fn rules_quoted_ask_phrase_en_is_all_set() {
+        all_set("The earlier turn showed your turn because the phrase \"let me know\" matched.\nI changed the matcher to skip quoted text.");
+    }
+
+    #[test]
+    fn rules_backtick_code_en_is_all_set() {
+        all_set("The rule matched `should I` inside code.\nAll tests pass.");
+    }
+
+    #[test]
+    fn rules_apostrophe_not_a_quote_en_stays_your_turn() {
+        assert_eq!(
+            your_turn("I don't think we need that, and it's fine.\nLet me know if you want more."),
+            "Let me know if you want more."
+        );
+    }
+
+    #[test]
+    fn rules_phrase_middle_of_long_reply_is_all_set() {
+        let mut long = String::from("如果你想要的話，可以跟我說細節。\n");
+        for i in 1..=8 {
+            long.push_str(&format!("第 {i} 點已完成。\n"));
+        }
+        all_set(&long);
+        all_set("Let me know which part you want.\nThe change is small.\nAll tests pass.");
+    }
+
+    #[test]
+    fn rules_unclosed_bracket_is_plain_text() {
+        assert_eq!(your_turn("我還沒改完「跟我說這句\n目前沒有其他問題。"), "我還沒改完「跟我說這句");
     }
 
     fn stop_with(text: Option<&str>, workflows: Option<(u32, u32)>) -> Payload {
