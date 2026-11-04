@@ -403,9 +403,10 @@ fn is_option_line(line: &str) -> bool {
 /// each line with quoted and code spans removed, so a quoted or mentioned phrase
 /// is not a question. The returned detail is the line as written.
 /// 1. The last line ends with `?` / `？`.
-/// 2. At least two option lines (`1.`, `A)`, `①`…) in a group whose intro line,
-///    within 2 lines before it, ends with `?`, or ends with `:` and names a choice
-///    ("option", "which", "選", "方案", "哪"…). A plain "Changes:\n1. …" stays all_set.
+/// 2. At least two option lines (`1.`, `A)`, `①`…) ending within the last 2 lines,
+///    in a group whose intro line, within 2 lines before it, ends with `?`, or ends
+///    with `:` and names a choice ("option", "which", "選", "方案", "哪"…). A plain
+///    "Changes:\n1. …" stays all_set.
 /// 3. One of the last 2 lines contains an asking phrase ("should I", "let me know",
 ///    "要不要", "可以嗎"…).
 pub fn classify_turn_end(text: &str) -> Option<String> {
@@ -433,9 +434,12 @@ pub fn classify_turn_end(text: &str) -> Option<String> {
         if ends_with_question(last) {
             return Some(last_text.clone());
         }
-        if let Some(end) = tail.iter().rposition(|(_, l)| is_option_line(l)) {
+        // The option group must end within the last ASK_TAIL_LINES lines. Option
+        // markers are read from the line as written, so `1. \`code\`` still counts.
+        let window_start = tail.len().saturating_sub(ASK_TAIL_LINES);
+        if let Some(end) = (window_start..tail.len()).rev().find(|&i| is_option_line(&tail[i].0)) {
             let mut start = end;
-            while start > 0 && is_option_line(&tail[start - 1].1) {
+            while start > 0 && is_option_line(&tail[start - 1].0) {
                 start -= 1;
             }
             if end - start + 1 >= 2 {
@@ -1076,6 +1080,24 @@ mod tests {
     #[test]
     fn rules_unclosed_bracket_is_plain_text() {
         assert_eq!(your_turn("我還沒改完「跟我說這句\n目前沒有其他問題。"), "我還沒改完「跟我說這句");
+    }
+
+    #[test]
+    fn rules_code_option_items_still_count_as_options() {
+        assert_eq!(your_turn("目前有兩個方案：\n1. `SMAppService`\n2. `子程序`"), "目前有兩個方案：");
+        assert_eq!(your_turn("Pick one:\n1. `SMAppService`\n2. \"subprocess\""), "Pick one:");
+    }
+
+    #[test]
+    fn rules_options_early_in_reply_are_all_set() {
+        all_set("請選一個方案：\n1. A\n2. B\n已完成改動。\n測試通過。");
+        all_set("Which option do you want?\n1. A\n2. B\nI already applied the change.\nAll tests pass.");
+    }
+
+    #[test]
+    fn rules_option_list_at_end_is_your_turn() {
+        assert_eq!(your_turn("已列出方案。\n請選一個方案：\n1. A\n2. B"), "請選一個方案：");
+        assert_eq!(your_turn("Which option?\n1. A\n2. B"), "Which option?");
     }
 
     fn stop_with(text: Option<&str>, workflows: Option<(u32, u32)>) -> Payload {
