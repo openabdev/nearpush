@@ -71,6 +71,10 @@ The event log is compacted on start when it holds more than twice `buffer_size` 
 
 ### LaunchAgent
 
+`deploy/install-launchagent.sh` renders `deploy/dev.nearpush.daemon.plist.in` into
+`~/Library/LaunchAgents/dev.nearpush.daemon.plist` (replacing `@HOME@`), creates the log
+directory and bootstraps it (booting out a previous copy first). The result is:
+
 `~/Library/LaunchAgents/dev.nearpush.daemon.plist`:
 
 ```xml
