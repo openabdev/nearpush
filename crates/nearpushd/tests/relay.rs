@@ -402,6 +402,35 @@ async fn keychain_failure_disables_relay_without_crash() {
 }
 
 #[tokio::test]
+async fn cursor_write_failure_backs_off_exponentially() {
+    let fx = Fixture::new().await;
+    let state = fx.app_state();
+    // A regular file where the cursor directory should be: every cursor save fails.
+    let blocker = fx.state_dir.join("blocker");
+    fs::write(&blocker, "not a directory").unwrap();
+    let cursor = blocker.join("relay-cursor.json");
+    for _ in 0..3 {
+        fx.relay.reply(Reply::Page(vec![titled(1)]));
+    }
+    let cfg = RelayConfig {
+        enabled: true,
+        url: Some(fx.relay.url.clone()),
+        wait_secs: 1,
+        ..RelayConfig::default()
+    };
+    let task = tokio::spawn(relay::run(state.clone(), cfg, CONSUMER_TOKEN.into(), cursor));
+    wait_for(|| fx.relay.gets().len() >= 3, "retries after cursor failures").await;
+    let gets = fx.relay.gets();
+    let gap1 = gets[1].at - gets[0].at;
+    let gap2 = gets[2].at - gets[1].at;
+    assert!(gap1 >= Duration::from_secs(1), "first retry waits at least 1s: {gap1:?}");
+    assert!(gap2 >= Duration::from_secs(2), "backoff grows on repeated cursor failures: {gap2:?}");
+    assert!(fx.relay.acks().is_empty(), "nothing is acked while the cursor cannot be saved");
+    assert_eq!(relay_ids(&state), vec![1], "the event is shown once, not on every retry");
+    task.abort();
+}
+
+#[tokio::test]
 async fn relay_health_starts_disabled() {
     let health = RelayHealth::default();
     let v = health.view();

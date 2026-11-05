@@ -331,13 +331,19 @@ pub async fn run(state: AppState, cfg: RelayConfig, token: String, cursor_path: 
     tracing::info!(url = cfg.url.as_deref().unwrap_or(""), cursor, "relay puller started");
 
     let mut pending_ack: Option<u64> = None;
+    // Set when the pending ack covers a batch that was fully processed. Only that ack
+    // ends the backoff, so a partly failed batch keeps the growing delay.
+    let mut ack_clears_backoff = false;
     let mut failures: u32 = 0;
     loop {
         if let Some(through) = pending_ack {
             match client.ack(through).await {
                 Ok(()) => {
                     pending_ack = None;
-                    failures = 0;
+                    if ack_clears_backoff {
+                        failures = 0;
+                        ack_clears_backoff = false;
+                    }
                     health.set_ok(now_ms());
                 }
                 Err(e) => {
@@ -358,7 +364,6 @@ pub async fn run(state: AppState, cfg: RelayConfig, token: String, cursor_path: 
                 continue;
             }
         };
-        failures = 0;
         health.set_ok(now_ms());
 
         let mut events = page.events;
@@ -393,6 +398,7 @@ pub async fn run(state: AppState, cfg: RelayConfig, token: String, cursor_path: 
                     cursor = done;
                     health.last_id.store(cursor, Ordering::Relaxed);
                     pending_ack = Some(cursor);
+                    ack_clears_backoff = failure.is_none();
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "cannot save relay cursor; the batch will be fetched again");
@@ -400,10 +406,14 @@ pub async fn run(state: AppState, cfg: RelayConfig, token: String, cursor_path: 
                 }
             }
         }
-        if let Some(e) = failure {
-            if !after_error(&health, e, &mut failures).await {
-                return;
+        match failure {
+            Some(e) => {
+                if !after_error(&health, e, &mut failures).await {
+                    return;
+                }
             }
+            None if pending_ack.is_none() => failures = 0,
+            None => {}
         }
     }
 }
