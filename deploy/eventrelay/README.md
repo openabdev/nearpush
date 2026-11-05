@@ -35,12 +35,13 @@ with `rsync -a --exclude .git --exclude .agents --exclude target ./ macmini:~/re
 Run this after the Secrets exist (step a). Otherwise the pod stays in `ContainerCreating`.
 
 ```sh
-cat deploy/eventrelay/k8s/*.yaml | ssh p1 "sudo kubectl apply -f -"
+for f in deploy/eventrelay/k8s/*.yaml; do ssh p1 "sudo kubectl apply -f -" < "$f"; done
 ssh p1 "sudo kubectl -n nearpush-relay rollout status deploy/eventrelay --timeout=120s"
 ```
 
-`kubectl apply -f -` reads the concatenated files in name order, so the namespace is created
-first.
+The loop applies one file at a time in name order, so the namespace is created first. Do not
+concatenate the files with `cat`: each file is a separate YAML document, and joining them without
+`---` separators produces an invalid document.
 
 ## (a) Create the two Secrets
 
@@ -174,7 +175,7 @@ Narrow or remove any such rule.
 ssh p1 "sudo tailscale serve --https=8443 off"
 
 # 2. Delete the workload and its network policy.
-cat deploy/eventrelay/k8s/{40-networkpolicy,30-deployment,20-service}.yaml | ssh p1 "sudo kubectl delete -f -"
+for f in 40-networkpolicy 30-deployment 20-service; do ssh p1 "sudo kubectl delete -f -" < "deploy/eventrelay/k8s/$f.yaml"; done
 
 # 3. Delete the Secrets and the PVC. This deletes the stored events.
 ssh p1 "sudo kubectl -n nearpush-relay delete secret eventrelay-source-tokens eventrelay-consumer-token"
