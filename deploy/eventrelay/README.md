@@ -30,18 +30,14 @@ ssh p1 "sudo k3s ctr images ls -q | grep eventrelay"
 The `macmini` checkout must contain the committed tree. Copy it there first, for example
 with `rsync -a --exclude .git --exclude .agents --exclude target ./ macmini:~/repo/nearpush/`.
 
-## Apply the manifests
+## Create the namespace
 
-Run this after the Secrets exist (step a). Otherwise the pod stays in `ContainerCreating`.
+Run this first. The Secrets in step (a) go into this namespace, and `kubectl create secret`
+fails with "namespace not found" until it exists.
 
 ```sh
-for f in deploy/eventrelay/k8s/*.yaml; do ssh p1 "sudo kubectl apply -f -" < "$f"; done
-ssh p1 "sudo kubectl -n nearpush-relay rollout status deploy/eventrelay --timeout=120s"
+ssh p1 "sudo kubectl apply -f -" < deploy/eventrelay/k8s/00-namespace.yaml
 ```
-
-The loop applies one file at a time in name order, so the namespace is created first. Do not
-concatenate the files with `cat`: each file is a separate YAML document, and joining them without
-`---` separators produces an invalid document.
 
 ## (a) Create the two Secrets
 
@@ -49,7 +45,8 @@ Values stay out of files and command lines where possible. The consumer token li
 laptop's login keychain. The source tokens live in one file on the laptop, mode 0600, because
 the producers need them.
 
-Do step (c) first. It creates the keychain item that holds the consumer token.
+Do step (c) first. It creates the keychain item that holds the consumer token. Create the
+namespace before this step (see "Create the namespace" above).
 
 Create the consumer Secret from the keychain value. `security -w` writes the value to the
 pipe, and `kubectl` reads it from stdin:
@@ -81,6 +78,19 @@ To rotate a Secret, delete it on p1 and create it again. Then restart the Deploy
 Mode 0440 with group 65532 is the closest in-pod equivalent of 0600. kubelet writes Secret
 files as root, so the file cannot be owned by uid 65532. With `fsGroup: 65532` the group is
 65532, and only that group can read the file.
+
+## Apply the workload manifests
+
+Run this after both Secrets exist. The Deployment mounts both, and the pod stays in
+`ContainerCreating` until they do. The namespace is already created, so skip
+`00-namespace.yaml`. Apply the other files one at a time. Do not concatenate them with `cat`:
+each file is a separate YAML document, and joining them without `---` separators produces an
+invalid document.
+
+```sh
+for f in 10-pvc 20-service 30-deployment 40-networkpolicy; do ssh p1 "sudo kubectl apply -f -" < "deploy/eventrelay/k8s/$f.yaml"; done
+ssh p1 "sudo kubectl -n nearpush-relay rollout status deploy/eventrelay --timeout=120s"
+```
 
 ## (b) Expose the consumer side on p1 with tailscale serve
 
