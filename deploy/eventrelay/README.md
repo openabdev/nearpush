@@ -27,6 +27,11 @@ ssh p1 "sudo k3s ctr images ls -q | grep eventrelay"
 
 `imagePullPolicy` is `Never`, so the image must already be on p1 before the Deployment starts.
 
+Last verified build (commit `5c08648`): the path above, run as written. The build ran on macmini
+with OrbStack docker buildx `--platform linux/amd64 --load`. The cargo step came from BuildKit
+cache, because its inputs matched an earlier build. p1 then lists `docker.io/library/eventrelay:0.1.0`
+as `linux/amd64` with index digest `sha256:a1e5a937…`, which is the digest macmini reported for the build.
+
 The `macmini` checkout must contain the committed tree. Copy it there first, for example
 with `rsync -a --exclude .git --exclude .agents --exclude target ./ macmini:~/repo/nearpush/`.
 
