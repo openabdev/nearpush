@@ -27,50 +27,55 @@ ssh p1 "sudo k3s ctr images ls -q | grep eventrelay"
 
 `imagePullPolicy` is `Never`, so the image must already be on p1 before the Deployment starts.
 
+The `macmini` checkout must contain the committed tree. Copy it there first, for example
+with `rsync -a --exclude .git --exclude .agents --exclude target ./ macmini:~/repo/nearpush/`.
+
 ## Apply the manifests
 
+Run this after the Secrets exist (step a). Otherwise the pod stays in `ContainerCreating`.
+
 ```sh
-sudo kubectl apply -f deploy/eventrelay/k8s/
-sudo kubectl -n nearpush-relay rollout status deploy/eventrelay --timeout=120s
+cat deploy/eventrelay/k8s/*.yaml | ssh p1 "sudo kubectl apply -f -"
+ssh p1 "sudo kubectl -n nearpush-relay rollout status deploy/eventrelay --timeout=120s"
 ```
 
-Run the `apply` after the Secrets exist (step a). Otherwise the pod stays in
-`ContainerCreating`.
+`kubectl apply -f -` reads the concatenated files in name order, so the namespace is created
+first.
 
-## (a) Create the two Secrets from files
+## (a) Create the two Secrets
 
-Both files are plain text and must be readable only by you. Use `umask 077` so the shell
-creates them with mode 0600.
+Values stay out of files and command lines where possible. The consumer token lives in the
+laptop's login keychain. The source tokens live in one file on the laptop, mode 0600, because
+the producers need them.
 
-Source tokens file, one `name:token` line per producer. The name matches
-`[a-z0-9-]{1,32}`. The token is at least 32 characters with no whitespace:
+Do step (c) first. It creates the keychain item that holds the consumer token.
 
-```
-openab-pty:<64 hex characters>
-```
+Create the consumer Secret from the keychain value. `security -w` writes the value to the
+pipe, and `kubectl` reads it from stdin:
 
-Consumer token file, one line holding the token only (at least 32 characters, no whitespace):
-
-```
-<64 hex characters>
+```sh
+security find-generic-password -s nearpush-eventrelay-token -w \
+  | ssh p1 "sudo kubectl -n nearpush-relay create secret generic eventrelay-consumer-token --from-file=consumer-token=/dev/stdin"
 ```
 
-Generate and create the Secrets on p1 without printing the values:
+Create the source-token Secret from a file. The file holds one `name:token` line per producer.
+The name matches `[a-z0-9-]{1,32}`, and the token is at least 32 characters with no whitespace:
 
 ```sh
 umask 077
-{ printf 'openab-pty:'; openssl rand -hex 32; } > source-tokens
-openssl rand -hex 32 > consumer-token
+mkdir -p ~/.config/nearpush-eventrelay
+{ printf 'openab-pty:'; openssl rand -hex 32; } > ~/.config/nearpush-eventrelay/source-tokens
+chmod 600 ~/.config/nearpush-eventrelay/source-tokens
 
-sudo kubectl -n nearpush-relay create secret generic eventrelay-source-tokens --from-file=source-tokens=source-tokens
-sudo kubectl -n nearpush-relay create secret generic eventrelay-consumer-token --from-file=consumer-token=consumer-token
-
-rm -f source-tokens consumer-token
+cat ~/.config/nearpush-eventrelay/source-tokens \
+  | ssh p1 "sudo kubectl -n nearpush-relay create secret generic eventrelay-source-tokens --from-file=source-tokens=/dev/stdin"
 ```
 
-Create the namespace first if it does not exist yet (`sudo kubectl apply -f k8s/00-namespace.yaml`).
-Keep the consumer token value. Step (c) needs the same value on the laptop. The source
-tokens go to the producers, not the laptop.
+Keep `~/.config/nearpush-eventrelay/source-tokens`. Copy the `openab-pty` token value into the
+producer's own secret store. Do not delete the file before that copy is done.
+
+To rotate a Secret, delete it on p1 and create it again. Then restart the Deployment with
+`sudo kubectl -n nearpush-relay rollout restart deploy/eventrelay`.
 
 Mode 0440 with group 65532 is the closest in-pod equivalent of 0600. kubelet writes Secret
 files as root, so the file cannot be owned by uid 65532. With `fsGroup: 65532` the group is
@@ -84,14 +89,14 @@ The Service is ClusterIP only. `tailscale serve` on p1 forwards the tailnet HTTP
 Read the ClusterIP:
 
 ```sh
-sudo kubectl -n nearpush-relay get svc eventrelay -o jsonpath='{.spec.clusterIP}'; echo
+ssh p1 "sudo kubectl -n nearpush-relay get svc eventrelay -o jsonpath='{.spec.clusterIP}'; echo"
 ```
 
 Check the existing serve config, then add the 8443 mapping:
 
 ```sh
-sudo tailscale serve status
-sudo tailscale serve --bg --https=8443 http://<ClusterIP>:8080
+ssh p1 "sudo tailscale serve status"
+ssh p1 "sudo tailscale serve --bg --https=8443 http://<ClusterIP>:8080"
 ```
 
 Port choice: 8443 is a non-default HTTPS port, so it does not share 443 with other serve
@@ -114,8 +119,18 @@ Create the item and leave the value off the command line, so `security` prompts 
 security add-generic-password -s nearpush-eventrelay-token -a "$USER" -w
 ```
 
-Paste the consumer token from step (a) at the `password:` prompt. If the item already exists,
-add `-U` to update it.
+Generate the value first and paste it at the `password:` prompt. Copy it to the clipboard
+without printing it, then clear the clipboard after the prompt:
+
+```sh
+openssl rand -hex 32 | pbcopy
+security add-generic-password -s nearpush-eventrelay-token -a "$USER" -w
+# paste with Cmd-V at the password: prompt, then:
+pbcopy </dev/null
+```
+
+If the item already exists, add `-U` to update it. Update the p1 Secret in the same way
+(see the rotation note in step a), so both sides hold the same value.
 
 Check that the item exists without printing it:
 
@@ -156,20 +171,21 @@ Narrow or remove any such rule.
 
 ```sh
 # 1. Stop the tailnet path.
-sudo tailscale serve --https=8443 off
+ssh p1 "sudo tailscale serve --https=8443 off"
 
 # 2. Delete the workload and its network policy.
-sudo kubectl delete -f deploy/eventrelay/k8s/40-networkpolicy.yaml -f deploy/eventrelay/k8s/30-deployment.yaml -f deploy/eventrelay/k8s/20-service.yaml
+cat deploy/eventrelay/k8s/{40-networkpolicy,30-deployment,20-service}.yaml | ssh p1 "sudo kubectl delete -f -"
 
 # 3. Delete the Secrets and the PVC. This deletes the stored events.
-sudo kubectl -n nearpush-relay delete secret eventrelay-source-tokens eventrelay-consumer-token
-sudo kubectl -n nearpush-relay delete pvc eventrelay-data
+ssh p1 "sudo kubectl -n nearpush-relay delete secret eventrelay-source-tokens eventrelay-consumer-token"
+ssh p1 "sudo kubectl -n nearpush-relay delete pvc eventrelay-data"
 
 # 4. Optional: remove the namespace.
-sudo kubectl delete namespace nearpush-relay
+ssh p1 "sudo kubectl delete namespace nearpush-relay"
 
-# 5. On the laptop: remove the keychain item.
+# 5. On the laptop: remove the keychain item and the local source-token file.
 security delete-generic-password -s nearpush-eventrelay-token
+rm -f ~/.config/nearpush-eventrelay/source-tokens
 ```
 
 Then remove the tailnet ACL grant from step (d).
