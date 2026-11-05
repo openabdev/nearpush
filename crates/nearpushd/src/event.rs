@@ -100,6 +100,9 @@ pub struct NewEvent {
     /// Set by the server while paused; clients cannot send it.
     #[serde(skip)]
     pub muted: bool,
+    /// Id of the relay event this came from; set by the relay puller, never by clients.
+    #[serde(skip)]
+    pub relay_id: Option<u64>,
 }
 
 /// A stored event, as persisted in JSONL and sent to subscribers.
@@ -146,6 +149,9 @@ pub struct Event {
     /// Pushed while paused: stored, never broadcast or replayed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
+    /// Relay event id, kept so the puller does not show the same event twice after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_id: Option<u64>,
 }
 
 impl Event {
@@ -278,6 +284,7 @@ impl NewEvent {
             workflows_running,
             workflows_waiting,
             muted: self.muted,
+            relay_id: self.relay_id,
         })
     }
 
@@ -304,6 +311,7 @@ impl NewEvent {
             workflows_running: self.workflows_running,
             workflows_waiting: self.workflows_waiting,
             muted: self.muted,
+            relay_id: self.relay_id,
         }
     }
 }

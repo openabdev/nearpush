@@ -32,6 +32,7 @@ use crate::assets;
 use crate::config::{DEFAULT_FILTER_STATES, SummarizerConfig};
 use crate::control::Control;
 use crate::event::{AgentState, Event, NewEvent};
+use crate::relay::{RelayHealth, RelayView};
 use crate::sessions::{SessionUpdate, Sessions};
 use crate::store::{Store, now_ms};
 use crate::summarizer::{Summarizer, SummarizerHealth};
@@ -98,6 +99,8 @@ pub struct AppState {
     /// The page's public URL, from config or tailscale discovery.
     pub public_url: Arc<RwLock<Option<String>>>,
     pub summarizer_health: Arc<SummarizerHealth>,
+    /// Relay puller state for `/status`.
+    pub relay: Arc<RelayHealth>,
     /// Serializes `POST /control` updates.
     control_write: Arc<tokio::sync::Mutex<()>>,
 }
@@ -124,6 +127,7 @@ impl AppState {
             started_at_ms: now_ms(),
             public_url: Arc::new(RwLock::new(None)),
             summarizer_health: Arc::new(SummarizerHealth::default()),
+            relay: Arc::new(RelayHealth::default()),
             control_write: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -207,7 +211,7 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
 }
 
 #[derive(Debug)]
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl ApiError {
     fn new(code: StatusCode, msg: impl Into<String>) -> Self {
@@ -318,7 +322,16 @@ async fn push(
     authorize_push(peer, &headers, &state.token)?;
     let new: NewEvent = serde_json::from_slice(&body)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid payload: {e}")))?;
-    let mut new = new.validate(now_ms()).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    let new = new.validate(now_ms()).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    let ev = accept_event(&state, new).await?;
+    tracing::info!(id = ev.id, title = %ev.title, muted = ev.muted, "event accepted");
+    Ok(Json(PushResponse { id: ev.id, ts: ev.ts }))
+}
+
+/// Runs a validated event through the card pipeline: pause flag, session label,
+/// summarizer and the event store. `POST /push` and the relay puller both call this,
+/// so an event from either source is shown, filtered and summarized the same way.
+pub async fn accept_event(state: &AppState, mut new: NewEvent) -> Result<Arc<Event>, ApiError> {
     // Paused (DND): stored and marked muted, never broadcast or replayed.
     new.muted = state.control.read().unwrap_or_else(|p| p.into_inner()).paused;
     // The prompt only feeds the summarizer; it is never stored with the event, and
@@ -350,8 +363,7 @@ async fn push(
             sum.request(s);
         }
     }
-    tracing::info!(id = ev.id, title = %ev.title, muted = ev.muted, "event accepted");
-    Ok(Json(PushResponse { id: ev.id, ts: ev.ts }))
+    Ok(ev)
 }
 
 #[derive(Serialize)]
@@ -413,6 +425,7 @@ struct StatusView<'a> {
     paused: bool,
     filter: FilterView,
     summarizer: SummarizerView,
+    relay: RelayView,
     public_url: Option<String>,
     recent: Vec<RecentView<'a>>,
 }
@@ -445,6 +458,7 @@ async fn status(
             last_ok_ms: h.last_ok_ms.load(Ordering::Relaxed),
             last_error_ms: h.last_err_ms.load(Ordering::Relaxed),
         },
+        relay: state.relay.view(),
         public_url: state.public_url.read().unwrap_or_else(|p| p.into_inner()).clone(),
         recent: recent
             .iter()

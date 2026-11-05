@@ -156,6 +156,8 @@ async fn run(args: Args) -> std::io::Result<()> {
         Err(e) => return Err(e),
     };
     tracing::info!(addr = %cfg.listen, "listening");
+    // Relay puller: runs beside the listener and never delays startup or /push.
+    let _ = nearpushd::relay::spawn_from_config(state.clone(), cfg.relay.clone(), cfg.relay.cursor_path(&paths.state_dir));
 
     let mut term = signal(SignalKind::terminate())?;
     tokio::select! {

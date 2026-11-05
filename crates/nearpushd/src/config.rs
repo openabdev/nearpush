@@ -66,6 +66,8 @@ pub struct Config {
     pub hook: HookConfig,
     /// The page's public URL (shown by `/status`). Unset: derived from tailscale.
     pub public_url: Option<String>,
+    /// Event relay puller (see `crates/eventrelay`).
+    pub relay: RelayConfig,
 }
 
 /// Default display filter: `working` is off.
@@ -124,6 +126,61 @@ impl Default for SummarizerConfig {
     }
 }
 
+pub const DEFAULT_RELAY_KEYCHAIN_SERVICE: &str = "nearpush-eventrelay-token";
+pub const DEFAULT_RELAY_WAIT_SECS: u64 = 25;
+pub const MAX_RELAY_WAIT_SECS: u64 = 25;
+/// Cursor file name inside the state directory.
+pub const RELAY_CURSOR_FILE: &str = "relay-cursor.json";
+
+/// `[relay]`: where the laptop pulls events from. The consumer token is never in
+/// this file; it is read from the login keychain at start.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RelayConfig {
+    pub enabled: bool,
+    /// Base URL of the relay's consumer path, e.g. `https://p1.<tailnet>.ts.net:8443`.
+    pub url: Option<String>,
+    /// Keychain service holding the consumer token (`security find-generic-password -w`).
+    pub consumer_token_keychain_service: String,
+    /// Long-poll wait sent to the relay, 1..=25 seconds.
+    pub wait_secs: u64,
+    /// Cursor file. Default: `<state dir>/relay-cursor.json`. A leading `~/` is expanded.
+    pub state_file: Option<PathBuf>,
+    /// The `security` binary used for the keychain lookup (tests point it at a fake).
+    pub security_program: String,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        RelayConfig {
+            enabled: false,
+            url: None,
+            consumer_token_keychain_service: DEFAULT_RELAY_KEYCHAIN_SERVICE.to_string(),
+            wait_secs: DEFAULT_RELAY_WAIT_SECS,
+            state_file: None,
+            security_program: DEFAULT_SECURITY_PROGRAM.to_string(),
+        }
+    }
+}
+
+impl RelayConfig {
+    /// Where the cursor is stored: `state_file`, or `<state_dir>/relay-cursor.json`.
+    pub fn cursor_path(&self, state_dir: &Path) -> PathBuf {
+        match &self.state_file {
+            Some(p) => expand_home(p),
+            None => state_dir.join(RELAY_CURSOR_FILE),
+        }
+    }
+}
+
+/// Expands a leading `~/` from `$HOME`.
+fn expand_home(p: &Path) -> PathBuf {
+    match (p.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -135,6 +192,7 @@ impl Default for Config {
             filter: FilterConfig::default(),
             hook: HookConfig::default(),
             public_url: None,
+            relay: RelayConfig::default(),
         }
     }
 }
@@ -178,6 +236,21 @@ impl Config {
             let lower = u.to_ascii_lowercase();
             if !(lower.starts_with("https://") || lower.starts_with("http://")) || u.len() > 2048 {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "public_url must start with http:// or https://"));
+            }
+        }
+        if self.relay.wait_secs == 0 || self.relay.wait_secs > MAX_RELAY_WAIT_SECS {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "relay.wait_secs must be 1..=25"));
+        }
+        if self.relay.enabled {
+            let Some(u) = &self.relay.url else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "relay.url is required when relay.enabled is true"));
+            };
+            let lower = u.to_ascii_lowercase();
+            if !(lower.starts_with("https://") || lower.starts_with("http://")) || u.len() > 2048 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "relay.url must start with http:// or https://"));
+            }
+            if self.relay.consumer_token_keychain_service.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "relay.consumer_token_keychain_service is empty"));
             }
         }
         Ok(())
@@ -348,6 +421,32 @@ mod tests {
         assert_eq!(Config::default().summarizer.keychain_service, "nearpush-kiro-api-key");
         let cfg: Config = toml::from_str("[summarizer]\nkeychain_service = \"\"").unwrap();
         assert!(cfg.summarizer.keychain_service.is_empty());
+    }
+
+    #[test]
+    fn relay_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.relay.enabled);
+        assert_eq!(cfg.relay.wait_secs, 25);
+        assert_eq!(cfg.relay.consumer_token_keychain_service, "nearpush-eventrelay-token");
+        assert_eq!(cfg.relay.security_program, "/usr/bin/security");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.relay.cursor_path(Path::new("/s")), PathBuf::from("/s/relay-cursor.json"));
+
+        let cfg: Config = toml::from_str("[relay]\nenabled = true\nurl = \"https://p1.example.ts.net:8443\"").unwrap();
+        assert!(cfg.validate().is_ok());
+        let cfg: Config = toml::from_str("[relay]\nenabled = true").unwrap();
+        assert!(cfg.validate().is_err(), "enabled without url");
+        let cfg: Config = toml::from_str("[relay]\nenabled = true\nurl = \"javascript:x\"").unwrap();
+        assert!(cfg.validate().is_err());
+        for w in ["0", "26"] {
+            let cfg: Config = toml::from_str(&format!("[relay]\nwait_secs = {w}")).unwrap();
+            assert!(cfg.validate().is_err(), "wait_secs {w}");
+        }
+        assert!(toml::from_str::<Config>("[relay]\nbogus = 1").is_err());
+        assert!(toml::from_str::<Config>("[relay]\ntoken = \"x\"").is_err(), "no token key in config");
+        let cfg: Config = toml::from_str("[relay]\nstate_file = \"/tmp/c.json\"").unwrap();
+        assert_eq!(cfg.relay.cursor_path(Path::new("/s")), PathBuf::from("/tmp/c.json"));
     }
 
     #[test]

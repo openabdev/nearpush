@@ -28,3 +28,14 @@ timeout_secs = 30
 # KIRO_API_KEY for each run, read from the login keychain with
 # /usr/bin/security find-generic-password -s <service> -w. "" disables the lookup.
 keychain_service = "nearpush-kiro-api-key"
+
+# Event relay puller (crates/eventrelay). Off by default. The consumer token is
+# never in this file: store it with
+#   security add-generic-password -s nearpush-eventrelay-token -a "$USER" -U -w
+# [relay]
+# enabled = true
+# url = "https://<relay-host>.<tailnet>.ts.net:8443"   # the relay's consumer path
+# consumer_token_keychain_service = "nearpush-eventrelay-token"
+# wait_secs = 25                                        # long-poll wait, 1..=25
+# state_file = "~/.local/state/nearpush/relay-cursor.json"
+# security_program = "/usr/bin/security"

@@ -5,6 +5,7 @@ pub mod assets;
 pub mod config;
 pub mod control;
 pub mod event;
+pub mod relay;
 pub mod server;
 pub mod sessions;
 pub mod store;
