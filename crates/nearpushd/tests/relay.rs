@@ -278,6 +278,23 @@ async fn crash_window_skipped() {
 }
 
 #[tokio::test]
+async fn all_seen_batch_still_advances_cursor() {
+    // Crash after storing 6 and 7 but before the cursor moved past 5. The relay
+    // redelivers only those two ids, so the batch has nothing new to show.
+    let fx = Fixture::new().await;
+    let state = fx.app_state();
+    state.store.push(NewEvent { title: "six".into(), relay_id: Some(6), ..Default::default() }).unwrap();
+    state.store.push(NewEvent { title: "seven".into(), relay_id: Some(7), ..Default::default() }).unwrap();
+    relay::save_cursor(&fx.cursor, 5).unwrap();
+    fx.relay.reply(Reply::Page(vec![titled(6), titled(7)]));
+    let task = fx.start(&state);
+    wait_for(|| fx.relay.acks().iter().any(|a| a.through == 7), "ack through 7").await;
+    assert_eq!(relay::load_cursor(&fx.cursor), 7, "cursor moves past the seen batch");
+    assert_eq!(relay_ids(&state), vec![6, 7], "nothing shown twice");
+    task.abort();
+}
+
+#[tokio::test]
 async fn unauthorized_disables_worker() {
     let fx = Fixture::new().await;
     let state = fx.app_state();

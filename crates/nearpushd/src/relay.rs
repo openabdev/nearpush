@@ -366,7 +366,11 @@ pub async fn run(state: AppState, cfg: RelayConfig, token: String, cursor_path: 
         let mut done = cursor;
         let mut failure = None;
         for ev in events {
-            if ev.id <= done || seen.contains(ev.id) {
+            if ev.id <= done {
+                continue;
+            }
+            if seen.contains(ev.id) {
+                done = ev.id;
                 continue;
             }
             match to_new_event(&ev.source, ev.id, ev.body, now_ms()) {
