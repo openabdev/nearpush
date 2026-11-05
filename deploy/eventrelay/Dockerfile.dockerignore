@@ -1,0 +1,6 @@
+**/target
+.git
+.agents
+.worktrees
+macos
+deploy
