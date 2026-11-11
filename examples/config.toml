@@ -1,0 +1,50 @@
+# ~/.config/nearpush/config.toml: every key is optional; these are the defaults.
+listen = "127.0.0.1:8787"
+allowed_logins = []                 # empty: this node's own tailnet login
+buffer_size = 500
+allow_loopback_without_login = false
+# public_url = "https://my-laptop.example.ts.net/"   # unset: from tailscale status
+
+# Which agent states the page shows. Generic events from `nearpush send` without
+# --state always show. Hidden events are still stored (see GET /status) but not
+# broadcast, so neither the main card nor the history drawer shows them.
+# POST /control {"states": [...]} overrides this at runtime (kept in control.json).
+# Requires the menu-bar-era nearpushd: older daemons reject [filter] and [hook].
+# [filter]
+# states = ["all_set", "your_turn", "allow"]   # add "working" to see turn starts
+
+# Read by `nearpush hook`.
+# [hook]
+# include_subagents = false   # true: workflow-step / sub-agent sessions push too
+
+[summarizer]
+# Each run is a kiro-cli call billed to your Kiro account that sends the session's
+# stored prompts to Kiro's model service. false: no runs and no prompts kept.
+enabled = true
+# The prompts go on stdin, the label is read from stdout. Runs in
+# ~/.local/state/nearpush/summarizer/ with NEARPUSH_DISABLE=1 set.
+command = ["kiro-cli", "chat", "--no-interactive", "--model", "claude-haiku-5.5", "--trust-tools="]
+timeout_secs = 30
+# KIRO_API_KEY for each run, read from the login keychain with
+# /usr/bin/security find-generic-password -s <service> -w. "" disables the lookup.
+keychain_service = "nearpush-kiro-api-key"
+
+# Turn-end classifier: decides whether a finished turn is your_turn or all_set.
+# The reply tail (last lines, redacted) goes to the chosen provider. The card waits
+# up to 15 s for the answer, then falls back to the rules verdict.
+# [classifier]
+# enabled = true                 # false: rules verdict only, no provider calls
+# provider = "kiro"              # kiro = claude-haiku-5.5 via kiro-cli; openrouter or typesafe = Jev 1.13 over HTTPS
+# threshold = 0.5                # openrouter/typesafe: noul at or above this is your_turn (0..=1)
+# timeout_secs = 30              # provider's own limit (1..=30); the 15 s card hold is the binding limit
+
+# Event relay puller (crates/eventrelay). Off by default. The consumer token is
+# never in this file: store it with
+#   security add-generic-password -s nearpush-eventrelay-token -a "$USER" -U -w
+# [relay]
+# enabled = true
+# url = "https://<relay-host>.<tailnet>.ts.net:8443"   # the relay's consumer path
+# consumer_token_keychain_service = "nearpush-eventrelay-token"
+# wait_secs = 25                                        # long-poll wait, 1..=25
+# state_file = "~/.local/state/nearpush/relay-cursor.json"
+# security_program = "/usr/bin/security"

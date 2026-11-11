@@ -1,0 +1,927 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="nearpush">
+<meta name="format-detection" content="telephone=no">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<title>nearpush</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #f5f5f7;
+    --dim: #8e8e93;
+    --faint: #3a3a3c;
+    --red: #ff453a;
+    --green: #30d158;
+    --amber: #ffd60a;
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue",
+            "PingFang TC", "PingFang SC", "PingFang HK", "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+            "Noto Sans CJK TC", "Noto Sans CJK SC", "Microsoft JhengHei", sans-serif;
+    --pad-t: max(14px, env(safe-area-inset-top));
+    --pad-b: max(14px, env(safe-area-inset-bottom));
+    --pad-l: max(18px, env(safe-area-inset-left));
+    --pad-r: max(18px, env(safe-area-inset-right));
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
+    font-family: var(--font); -webkit-font-smoothing: antialiased;
+    -webkit-text-size-adjust: 100%; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  body { position: fixed; inset: 0; }
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+
+  #card {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    padding: var(--pad-t) var(--pad-r) var(--pad-b) var(--pad-l);
+    height: 100vh; height: 100dvh;
+  }
+  #top { display: flex; align-items: center; justify-content: flex-end; gap: 10px; min-height: 28px; flex: none; }
+  #meta { flex: 0 0 100%; min-width: 0; display: flex; align-items: center; gap: .45em;
+          font-size: clamp(14px, 4vmin, 22px); color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #meta > * { flex: none; }
+  #icon { height: 1.15em; width: auto; max-width: 1.6em; border-radius: .22em; }
+  #icon[hidden] { display: none; }
+  #app { color: var(--fg); font-weight: 600; }
+  #timer { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  #tag { color: #636366; }
+  #meta span:empty { display: none; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--amber); flex: none; transition: background .3s; }
+  #dot.live { background: var(--green); }
+  #dot.offline { background: var(--red); }
+  /* sound cue toggle and its unlock hint: small, inside #top's fixed height */
+  #sound { display: flex; align-items: center; padding: 4px; flex: none; color: var(--dim); }
+  #sound svg { width: 18px; height: 18px; display: block; fill: none; stroke: currentColor; stroke-width: 2;
+               stroke-linecap: round; stroke-linejoin: round; }
+  #sound .x { display: none; }
+  #sound.off .x { display: inline; } #sound.off .w { display: none; }
+  #soundhint { font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+               min-width: 0; flex: 0 1 auto; }
+  #soundhint[hidden] { display: none; }
+  #histbtn { display: flex; flex-direction: column; gap: 4px; padding: 8px 2px 8px 10px; flex: none; }
+  #histbtn i { display: block; width: 18px; height: 2px; background: var(--dim); border-radius: 1px; }
+
+  #headline {
+    flex: 1 1 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: center;
+    font-weight: 800; line-height: .98; letter-spacing: -0.035em; font-size: 80px;
+  }
+  #headline .line { display: block; white-space: nowrap; }
+  #headline.wrap .line { white-space: normal; letter-spacing: -0.02em; line-height: 1.08; }
+  .c-red { color: var(--red); } .c-green { color: var(--green); } .c-white { color: var(--fg); }
+  .c-dim { color: var(--dim); } .c-amber { color: var(--amber); }
+  .ast { display: inline-block; width: .5em; height: .5em; margin-left: .08em; vertical-align: .55em;
+         animation: pulse 2.4s ease-in-out infinite; transform-origin: 50% 50%; }
+  .ast svg { width: 100%; height: 100%; display: block; fill: currentColor; }
+  @keyframes pulse {
+    0%   { transform: rotate(0deg) scale(.82); opacity: .55; }
+    50%  { transform: rotate(30deg) scale(1.06); opacity: 1; }
+    100% { transform: rotate(60deg) scale(.82); opacity: .55; }
+  }
+  .working .ast { animation-duration: 1.2s; }
+
+  #lower { flex: none; padding-top: 10px; }
+  #lower .ln { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.25; }
+  #lower .ln:empty { display: none; }
+  #proj { font-size: clamp(14px, 4.2vmin, 24px); color: var(--dim); }
+  #label { font-size: clamp(15px, 4.6vmin, 28px); color: #d1d1d6; margin-top: 2px; }
+  #task { font-size: clamp(17px, 5.6vmin, 36px); font-weight: 600; margin-top: 4px; }
+  #detail { font-size: clamp(14px, 4.2vmin, 26px); color: var(--dim); margin-top: 2px; }
+  /* your_turn card: the question line is three 1.25x steps above the secondary text (4.2vmin): clamp(14,4.2vmin,26) x 1.25^3 */
+  #card.your_turn #detail { font-size: clamp(27px, 8.2vmin, 51px); white-space: normal; display: -webkit-box;
+         -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  #card.your_turn #detail:empty { display: none; }
+  /* agent-state cards: subtitle wraps to 2 lines (4 in landscape) */
+  #sub { font-size: clamp(15px, 4.6vmin, 30px); color: var(--dim); line-height: 1.25; margin-top: 2px;
+         display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  #sub:empty { display: none; }
+  /* generic notifications (no agent state): the whole body wraps; the lower block scrolls if it is long */
+  #card.generic #lower { max-height: 48%; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+  #card.generic #sub { display: block; -webkit-line-clamp: unset; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #foot { flex: none; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; padding-top: 12px;
+          font-size: clamp(13px, 3.6vmin, 20px); color: var(--dim); }
+  #missed { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #when, #pend, #wf { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #back { display: none; color: var(--fg); background: var(--faint); border-radius: 999px; padding: 3px 10px; }
+  body.pinned #back { display: inline-block; }
+  #card.fresh #headline, #card.fresh #lower { animation: arrive .45s ease-out; }
+  @keyframes arrive { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  #card.link { cursor: pointer; }
+  /* swipe-to-dismiss: horizontal drags belong to the card, vertical ones to the drawer gesture */
+  #card { touch-action: pan-y; will-change: transform, opacity; }
+  #card.idle .line { font-weight: 700; }
+  #toast { position: absolute; left: 50%; bottom: calc(var(--pad-b) + 8px); transform: translateX(-50%);
+           display: flex; align-items: center; gap: 14px; padding: 10px 16px; border-radius: 999px;
+           background: #2c2c2e; color: var(--fg); font-size: 15px; white-space: nowrap; z-index: 3;
+           box-shadow: 0 6px 24px rgba(0,0,0,.5); transition: opacity .2s; }
+  #toast[hidden] { display: none; }
+  #undo { color: var(--amber); font-weight: 600; padding: 2px 4px; }
+
+  /* landscape: headline left, details right, when there is room */
+  @media (orientation: landscape) and (min-aspect-ratio: 3/2) {
+    #card { display: grid; grid-template-columns: 1.35fr 1fr; grid-template-rows: auto minmax(0, 1fr) auto;
+            column-gap: 24px; }
+    #top { grid-column: 1 / 3; }
+    #headline { grid-column: 1; grid-row: 2; }
+    #lower { grid-column: 2; grid-row: 2; align-self: center; padding-top: 0; }
+    #foot { grid-column: 1 / 3; grid-row: 3; }
+    #sub { -webkit-line-clamp: 4; }
+  }
+
+  #drawer {
+    position: absolute; left: 0; right: 0; bottom: 0; max-height: 78%; display: flex; flex-direction: column;
+    background: #111113; border-radius: 18px 18px 0 0; transform: translateY(105%);
+    transition: transform .28s ease; padding-bottom: var(--pad-b); z-index: 2;
+  }
+  body.drawer #drawer { transform: none; }
+  #shade { position: absolute; inset: 0; background: rgba(0,0,0,.55); opacity: 0; pointer-events: none;
+           transition: opacity .28s; z-index: 1; }
+  body.drawer #shade { opacity: 1; pointer-events: auto; }
+  #drawer header { display: flex; align-items: center; padding: 10px var(--pad-r) 8px var(--pad-l); gap: 10px; flex: none; }
+  #drawer header .grab { position: absolute; left: 50%; top: 6px; width: 36px; height: 4px; margin-left: -18px;
+                         border-radius: 2px; background: var(--faint); }
+  #drawer h2 { margin: 0; font-size: 17px; flex: 1; padding-top: 6px; }
+  #conninfo { font-size: 12px; color: var(--dim); padding-top: 6px; text-align: right; }
+  #list { list-style: none; margin: 0; padding: 0 0 8px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+          overscroll-behavior: contain; }
+  #list li { display: flex; gap: 10px; align-items: center; padding: 10px var(--pad-r) 10px var(--pad-l);
+             border-top: 1px solid #1f1f22; }
+  #list li .d { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--dim); }
+  #list li .i { width: 18px; height: 18px; border-radius: 4px; flex: none; object-fit: contain; }
+  #list li .t { flex: 1; min-width: 0; }
+  #list li .k { font-size: 12px; color: var(--dim); }
+  #list li .n { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #list li .w { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; flex: none; }
+  #list li.cur { background: #1c1c1f; }
+  #list .empty { color: var(--dim); justify-content: center; }
+  .bg-red { background: var(--red) !important; } .bg-green { background: var(--green) !important; }
+  .bg-white { background: var(--fg) !important; } .bg-amber { background: var(--amber) !important; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ast { animation: none; }
+    #card.fresh #headline, #card.fresh #lower { animation: none; }
+    #toast { transition: none; }
+  }
+</style>
+</head>
+<body>
+<main id="card" aria-live="polite">
+  <div id="top">
+    <span id="soundhint" hidden>Tap to enable sound</span>
+    <button id="sound" aria-label="Sound" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 9h3l5-4v14l-5-4H4z"/><path class="w" d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12"/>
+      <path class="x" d="M16 9l5 6M21 9l-5 6"/></svg></button>
+    <div id="dot" title="connecting"></div>
+    <button id="histbtn" aria-label="Recent events"><i></i><i></i><i></i></button>
+  </div>
+  <div id="headline"></div>
+  <div id="lower">
+    <div id="detail" class="ln"></div>
+    <div id="proj" class="ln"></div>
+    <div id="label" class="ln"></div>
+    <div id="task" class="ln"></div>
+    <div id="sub"></div>
+  </div>
+  <div id="foot">
+    <div id="meta"><img id="icon" alt="" hidden><span id="app"></span><span id="timer"></span><span id="tag"></span></div>
+    <div id="missed"></div>
+    <button id="back">latest</button>
+    <div id="pend"></div>
+    <div id="wf"></div>
+    <div id="when"></div>
+  </div>
+</main>
+<div id="toast" role="status" hidden><span id="toastmsg"></span><button id="undo">Undo</button></div>
+<div id="shade"></div>
+<section id="drawer" aria-label="Recent events">
+  <header><span class="grab"></span><h2>Recent</h2><div id="conninfo"></div></header>
+  <ul id="list"></ul>
+</section>
+<script>
+(() => {
+  'use strict';
+  const PAGE_VERSION = '__NEARPUSH_VERSION__';
+  const LS_ID = 'nearpush.lastId', LS_EVENTS = 'nearpush.events', SS_RELOAD = 'nearpush.reloadedFor';
+  const KEEP = 100, STALE_MS = 50000, RESUME_STALE_MS = 25000, BACKOFF_MIN = 1000, BACKOFF_MAX = 30000;
+  const $ = (id) => document.getElementById(id);
+
+  const STATES = {
+    allow:     { lines: [['allow.', 'red']], dot: 'red', label: 'allow' },
+    your_turn: { lines: [['your', 'white'], ['turn.', 'red']], dot: 'red', label: 'your turn' },
+    all_set:   { lines: [['all', 'green'], ['set.', 'green']], dot: 'green', label: 'all set' },
+    working:   { lines: [['working.', 'dim']], dot: 'white', label: 'working' },
+  };
+  const LEVEL_COLOR = { info: 'white', warn: 'amber', error: 'red' };
+  const AST_SVG = '<svg viewBox="-50 -50 100 100" aria-hidden="true">' +
+    [0, 60, 120].map((a) => `<rect x="-7" y="-48" width="14" height="96" rx="3" transform="rotate(${a})"/>`).join('') +
+    '</svg>';
+
+  // ---- state -------------------------------------------------------------
+  let events = loadEvents();          // newest first
+  let lastId = Number(localStorage.getItem(LS_ID)) || 0;
+  if (events.length && events[0].id > lastId) lastId = events[0].id;
+  let ws = null, backoff = BACKOFF_MIN, retryTimer = null, retryAt = 0, lastMsgAt = 0;
+  let clockOffset = 0, pinnedId = null, shownId = undefined, wakeLock = null, renderQueued = false;
+  let status = 'connecting';
+  let missedNote = null;              // { n, until }
+  const MISSED_NOTE_MS = 120000;
+  // The server's main card: a pending your_turn, or working. after an answered one.
+  // null: the event stream decides (newest event, see displayed()).
+  let mainCard = null;
+  // Stored events up to this id are hidden from the main card (someone dismissed it).
+  let hiddenThrough = null;
+  // This page's own dismissal, applied before the server confirms it.
+  let dismissedKey = null, localHidden = null;
+  // Between a socket's hello and its synced frame: the events are a replay.
+  let replaying = true;
+
+  function loadEvents() {
+    try {
+      const v = JSON.parse(localStorage.getItem(LS_EVENTS) || '[]');
+      return Array.isArray(v) ? v.filter((e) => e && typeof e.id === 'number') : [];
+    } catch { return []; }
+  }
+  function save() {
+    try {
+      localStorage.setItem(LS_EVENTS, JSON.stringify(events.slice(0, KEEP)));
+      localStorage.setItem(LS_ID, String(lastId));
+    } catch { /* storage full or disabled: resume falls back to server replay */ }
+  }
+
+  // ---- connection --------------------------------------------------------
+  function setStatus(s) {
+    status = s;
+    const dot = $('dot');
+    dot.className = s === 'live' ? 'live' : s === 'offline' ? 'offline' : '';
+    dot.title = s;
+    updateConnInfo();
+  }
+
+  function connect() {
+    clearTimeout(retryTimer); retryTimer = null;
+    if (ws) {
+      const old = ws; ws = null;
+      old.onopen = old.onmessage = old.onclose = old.onerror = null;
+      try { old.close(); } catch { /* already closed */ }
+    }
+    setStatus('connecting');
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let sock;
+    try { sock = new WebSocket(`${proto}//${location.host}/ws?since=${lastId}`); }
+    catch { scheduleRetry(); return; }
+    ws = sock; lastMsgAt = Date.now();
+    sock.onmessage = (m) => {
+      if (ws !== sock) return;
+      lastMsgAt = Date.now();
+      let f; try { f = JSON.parse(m.data); } catch { return; }
+      onFrame(f);
+    };
+    sock.onclose = () => { if (ws !== sock) return; ws = null; scheduleRetry(); };
+  }
+
+  function scheduleRetry() {
+    if (retryTimer) return;
+    const wait = Math.min(backoff, BACKOFF_MAX) * (0.75 + Math.random() * 0.5);
+    backoff = Math.min(backoff * 2, BACKOFF_MAX);
+    retryAt = Date.now() + wait;
+    setStatus('offline');
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, wait);
+  }
+
+  function onFrame(f) {
+    switch (f.type) {
+      case 'hello':
+        if (typeof f.server_time === 'number') clockOffset = f.server_time - Date.now();
+        // The server sends its main card after the replay, only when there is one.
+        mainCard = null; hiddenThrough = null;
+        if (f.version !== PAGE_VERSION) {
+          // Self-update. Guard against a reload loop if a cache keeps serving the old page.
+          if (sessionStorage.getItem(SS_RELOAD) !== f.version) {
+            sessionStorage.setItem(SS_RELOAD, f.version);
+            location.reload();
+            return;
+          }
+        } else {
+          sessionStorage.removeItem(SS_RELOAD);
+        }
+        if (typeof f.last_id === 'number' && f.last_id < lastId) {
+          // Server history was reset: drop the stale cursor and start over.
+          events = []; lastId = 0; pinnedId = null; save(); queueRender();
+          connect();
+          return;
+        }
+        // A first-time viewer has nothing to miss; a returning one is told about the gap.
+        if (f.missed > 0 && lastId > 0) noteMissed(f.missed);
+        if (Array.isArray(f.labels)) f.labels.forEach((u) => applyLabel(u.session, u.label));
+        backoff = BACKOFF_MIN;
+        replaying = true; // events until 'synced' are the replay, not live
+        break;
+      case 'event':
+        if (addEvent(f.event) && !replaying) cue(f.event);
+        break;
+      case 'missed':
+        if (f.missed > 0) noteMissed(f.missed);
+        break;
+      case 'session_update':
+        applyLabel(f.session, f.label);
+        break;
+      case 'main_card':
+        mainCard = f.card || null;
+        dismissedKey = null; // the server's card is the truth from here on
+        queueRender();
+        break;
+      case 'hidden':
+        hiddenThrough = typeof f.through === 'number' ? f.through : null;
+        localHidden = null;
+        queueRender();
+        break;
+      case 'synced':
+        // The daemon's cursor includes events it hid (filtered or paused).
+        if (typeof f.last_id === 'number' && f.last_id > lastId) { lastId = f.last_id; save(); }
+        replaying = false;
+        setStatus('live');
+        break;
+      default:
+        break; // 'ping' and future frame types
+    }
+  }
+
+  function noteMissed(n) {
+    missedNote = { n: (missedNote && Date.now() < missedNote.until ? missedNote.n : 0) + n,
+                   until: Date.now() + MISSED_NOTE_MS };
+    queueRender();
+  }
+
+  // Summarized session labels arrive after the event; update matching cards in place.
+  function applyLabel(session, label) {
+    if (typeof session !== 'string' || typeof label !== 'string' || !label) return;
+    let changed = false;
+    for (const e of events) {
+      if (e.session === session && e.session_label !== label) { e.session_label = label; changed = true; }
+    }
+    if (mainCard && mainCard.session === session && mainCard.session_label !== label) {
+      mainCard.session_label = label; changed = true;
+    }
+    if (changed) { save(); queueRender(); }
+  }
+
+  // True when `e` is new to this page.
+  function addEvent(e) {
+    if (!e || typeof e.id !== 'number' || e.id <= lastId) return false;
+    lastId = e.id;
+    events.unshift(e);
+    if (events.length > KEEP) events.length = KEEP;
+    pinnedId = null;
+    save();
+    queueRender();
+    return true;
+  }
+
+  // iOS freezes sockets in the background; on return the socket can look open but be dead.
+  function resume() {
+    if (document.visibilityState !== 'visible') return;
+    backoff = BACKOFF_MIN;
+    const age = Date.now() - lastMsgAt;
+    const healthy = ws && ((ws.readyState === WebSocket.OPEN && age <= RESUME_STALE_MS) ||
+                           (ws.readyState === WebSocket.CONNECTING && age <= 10000));
+    if (!healthy) connect();
+    requestWake();
+    tick();
+  }
+  document.addEventListener('visibilitychange', resume);
+  window.addEventListener('pageshow', resume);
+  window.addEventListener('online', resume);
+  window.addEventListener('focus', resume);
+
+  setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    if (ws && Date.now() - lastMsgAt > STALE_MS) connect();
+    else if (!ws && !retryTimer) connect();
+  }, 5000);
+
+  // ---- screen wake lock ----------------------------------------------------
+  async function requestWake() {
+    if (!('wakeLock' in navigator) || wakeLock || document.visibilityState !== 'visible') { updateConnInfo(); return; }
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; updateConnInfo(); });
+    } catch { wakeLock = null; }
+    updateConnInfo();
+  }
+  // Some iOS versions only grant the lock from a user gesture.
+  document.addEventListener('touchend', () => { if (!wakeLock) requestWake(); }, { passive: true });
+
+  function updateConnInfo() {
+    const wl = !('wakeLock' in navigator) ? 'no wake lock' : wakeLock ? 'screen kept awake' : 'tap to keep awake';
+    let s = status;
+    if (status === 'offline' && retryTimer) s = `offline, retry in ${Math.max(0, Math.ceil((retryAt - Date.now()) / 1000))}s`;
+    $('conninfo').textContent = `${s} · ${wl}`;
+  }
+
+  // ---- rendering -----------------------------------------------------------
+  function fmtDur(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
+  }
+  function timing(e) {
+    if (!e) return '';
+    let d = e.duration_ms;
+    if (d == null && e.state === 'all_set' && e.started_at) d = e.ts - e.started_at;
+    if (d != null && d >= 0) return `took ${fmtDur(d)}`;
+    if (e.started_at) return `${fmtDur(Math.max(0, Date.now() + clockOffset - e.started_at))} so far`;
+    return '';
+  }
+  function clock(ts) {
+    const d = new Date(ts), now = new Date();
+    const hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return d.toDateString() === now.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  }
+  function safeUrl(u) {
+    return typeof u === 'string' && /^https?:\/\//i.test(u) ? u : null;
+  }
+  function spec(e) {
+    if (e && e.idle) return { lines: [['nothing', 'dim'], ['pending.', 'dim']], sub: '', task: '', wrap: false,
+                              state: 'idle', quiet: true };
+    if (!e) return { lines: [['waiting.', 'dim']], sub: 'no events yet', task: '', wrap: false, state: 'working' };
+    const st = STATES[e.state];
+    if (st) return { lines: st.lines, sub: e.subtitle || e.body || '', task: e.title, wrap: false, state: e.state };
+    return { lines: [[e.title, LEVEL_COLOR[e.level] || 'white']], sub: e.subtitle || e.body || '', task: '',
+             wrap: true, state: null };
+  }
+  function sessionTag(e) {
+    if (!e || typeof e.session !== 'string') return '';
+    const t = e.session.replace(/[^A-Za-z0-9]/g, '').slice(-4);
+    return t ? `#${t}` : '';
+  }
+  function appName(e) {
+    if (!e) return '';
+    if (e.app) return e.app;
+    if (!e.sender) return '';
+    return e.sender.length <= 3 ? e.sender.toUpperCase() : e.sender[0].toUpperCase() + e.sender.slice(1);
+  }
+  function iconUrl(e) {
+    return e && typeof e.sender === 'string' && /^[a-z0-9-]{1,32}$/.test(e.sender) ? `/icons/${e.sender}` : null;
+  }
+  // The task line repeats the headline for agent states ("all set." under "all set."); skip it then.
+  function taskLine(e, s) {
+    if (!e || !s.task) return '';
+    const norm = (t) => t.toLowerCase().replace(/[\s.]/g, '');
+    return STATES[e.state] && norm(s.task) === norm(STATES[e.state].label) ? '' : s.task;
+  }
+  function dotColor(e) {
+    const st = STATES[e.state];
+    return st ? st.dot : (LEVEL_COLOR[e.level] || 'white');
+  }
+
+  function current() {
+    if (pinnedId != null) { const p = events.find((e) => e.id === pinnedId); if (p) return p; pinnedId = null; }
+    return latestReal();
+  }
+  // The newest stored event that is a card (dismissal records only go to history).
+  function latestReal() { return events.find((e) => !e.dismissed) || null; }
+  const IDLE = { id: 'idle', idle: true };
+  function isHidden(e) {
+    const h = Math.max(hiddenThrough || 0, localHidden || 0);
+    return h > 0 && typeof e.id === 'number' && e.id <= h;
+  }
+
+  // Main card from the server. Its id changes with the state, so the card animates once per change.
+  function cardEvent(m) {
+    const working = m.state === 'working';
+    return { id: `${m.state}:${m.session}:${m.ts}`, ts: m.ts, state: m.state, level: 'info',
+             title: working ? 'working.' : 'your turn.', detail: m.question_line || null,
+             project: m.project, host: m.host, app: m.app, sender: m.sender, session: m.session,
+             session_label: m.session_label, started_at: m.started_at || null, count: m.count };
+  }
+
+  // A pinned history event wins; then the server's main card; then the newest event.
+  function displayed() {
+    if (pinnedId != null) { const p = events.find((e) => e.id === pinnedId); if (p) return p; pinnedId = null; }
+    if (mainCard) { const c = cardEvent(mainCard); if (c.id !== dismissedKey) return c; }
+    const cur = latestReal();
+    // A dismissed card leaves the quiet idle screen until something newer arrives.
+    if (cur && isHidden(cur)) return IDLE;
+    // No session waits on the user, so an older your_turn card has been resolved.
+    return cur && cur.state === 'your_turn' ? { ...cur, state: 'all_set', title: 'all set.', detail: null } : cur;
+  }
+
+  function queueRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => { renderQueued = false; render(); });
+  }
+
+  function render() {
+    const e = displayed();
+    const s = spec(e);
+    const card = $('card'), head = $('headline');
+    head.textContent = '';
+    head.className = s.wrap ? 'wrap' : '';
+    card.classList.toggle('working', s.state === 'working');
+    card.classList.toggle('generic', !!e && !s.state);
+    card.classList.toggle('your_turn', s.state === 'your_turn');
+    card.classList.toggle('idle', s.state === 'idle');
+    s.lines.forEach(([text, color], i) => {
+      const line = document.createElement('span');
+      line.className = `line c-${color}`;
+      line.textContent = text;
+      if (i === s.lines.length - 1 && !s.wrap && !s.quiet) {
+        const ast = document.createElement('span');
+        ast.className = 'ast';
+        ast.innerHTML = AST_SVG; // static markup, no event data
+        line.appendChild(ast);
+      }
+      head.appendChild(line);
+    });
+    const icon = $('icon'), url = iconUrl(e);
+    if (url) { if (icon.getAttribute('src') !== url) icon.src = url; icon.hidden = false; }
+    else { icon.hidden = true; icon.removeAttribute('src'); }
+    $('app').textContent = appName(e);
+    $('tag').textContent = sessionTag(e);
+    $('proj').textContent = e ? [e.project, e.host].filter(Boolean).join(' · ') : '';
+    $('label').textContent = (e && e.session_label) || '';
+    $('task').textContent = taskLine(e, s);
+    $('sub').textContent = s.sub;
+    $('detail').textContent = (e && e.detail) || '';
+    $('when').textContent = e && e.ts ? clock(e.ts) : '';
+    $('pend').textContent = e && e.count > 1 ? `還有 ${e.count} 個待回覆` : '';
+    // FYI only: a waiting workflow count shows on an all_set card, never on your_turn.
+    const waiting = e && e.state === 'all_set' ? e.workflows_waiting || 0 : 0;
+    $('wf').textContent = waiting ? `${waiting} wf waiting` : '';
+    document.body.classList.toggle('pinned', pinnedId != null);
+    card.classList.toggle('link', !!(e && safeUrl(e.url)));
+    if (e && e.id !== shownId) {
+      card.classList.remove('fresh'); void card.offsetWidth; card.classList.add('fresh');
+    }
+    shownId = e ? e.id : null;
+    tick();
+    fit();
+    renderList();
+  }
+
+  // Largest font size at which the headline still fits its box.
+  function fit() {
+    const el = $('headline');
+    let lo = 12, hi = Math.max(window.innerWidth, window.innerHeight) * 0.7;
+    for (let i = 0; i < 16; i++) {
+      const mid = (lo + hi) / 2;
+      el.style.fontSize = `${mid}px`;
+      if (el.scrollWidth <= el.clientWidth + 1 && el.scrollHeight <= el.clientHeight + 1) lo = mid; else hi = mid;
+    }
+    el.style.fontSize = `${Math.floor(lo)}px`;
+  }
+
+  function renderList() {
+    const list = $('list');
+    list.textContent = '';
+    if (!events.length) {
+      const li = document.createElement('li'); li.className = 'empty'; li.textContent = 'Nothing yet';
+      list.appendChild(li); return;
+    }
+    const cur = current();
+    for (const e of events) {
+      const li = document.createElement('li');
+      if (cur && e.id === cur.id) li.className = 'cur';
+      const d = document.createElement('span'); d.className = e.dismissed ? 'd' : `d bg-${dotColor(e)}`;
+      const t = document.createElement('div'); t.className = 't';
+      const k = document.createElement('div'); k.className = 'k';
+      const kind = e.dismissed ? 'dismissed' : STATES[e.state] ? STATES[e.state].label : e.level;
+      k.textContent = [kind, appName(e), sessionTag(e), e.project]
+        .filter(Boolean).join(' · ');
+      const n = document.createElement('div'); n.className = 'n';
+      n.textContent = e.session_label ? (e.detail ? `${e.session_label} — ${e.detail}` : e.session_label) : e.title;
+      t.append(k, n);
+      const w = document.createElement('span'); w.className = 'w'; w.textContent = clock(e.ts);
+      li.append(d);
+      const url = iconUrl(e);
+      if (url) { const i = document.createElement('img'); i.className = 'i'; i.alt = ''; i.src = url; li.append(i); }
+      li.append(t, w);
+      li.addEventListener('click', () => {
+        pinnedId = e.id === events[0].id ? null : e.id;
+        closeDrawer(); render();
+      });
+      list.appendChild(li);
+    }
+  }
+
+  function tick() {
+    $('timer').textContent = timing(displayed());
+    const m = $('missed');
+    if (missedNote && Date.now() < missedNote.until) {
+      m.textContent = `${missedNote.n} event${missedNote.n === 1 ? '' : 's'} missed`;
+    } else {
+      missedNote = null; m.textContent = '';
+    }
+    if (document.body.classList.contains('drawer')) updateConnInfo();
+  }
+  setInterval(tick, 1000);
+
+  // ---- interaction ---------------------------------------------------------
+  function openDrawer() { renderList(); updateConnInfo(); document.body.classList.add('drawer'); }
+  function closeDrawer() { document.body.classList.remove('drawer'); }
+  $('histbtn').addEventListener('click', (ev) => { ev.stopPropagation(); openDrawer(); });
+  $('shade').addEventListener('click', closeDrawer);
+  $('back').addEventListener('click', (ev) => { ev.stopPropagation(); pinnedId = null; render(); });
+  $('card').addEventListener('click', () => {
+    if (swiped) return;
+    const e = displayed(); const u = e && safeUrl(e.url);
+    if (u) window.open(u, '_blank', 'noopener');
+  });
+
+  let touchY = null, touchX = null;
+  document.addEventListener('touchstart', (ev) => {
+    touchY = ev.touches[0].clientY; touchX = ev.touches[0].clientX;
+  }, { passive: true });
+  document.addEventListener('touchend', (ev) => {
+    if (touchY == null) return;
+    const dy = ev.changedTouches[0].clientY - touchY, dx = ev.changedTouches[0].clientX - touchX; touchY = null;
+    if (Math.abs(dx) >= Math.abs(dy)) return; // horizontal: the swipe-to-dismiss gesture
+    const open = document.body.classList.contains('drawer');
+    if (!open && dy < -50) openDrawer();
+    else if (open && dy > 60 && $('list').scrollTop <= 0) closeDrawer();
+  }, { passive: true });
+  // Keep the main view from scrolling or bouncing; only the drawer list scrolls.
+  document.addEventListener('touchmove', (ev) => {
+    if (!ev.target.closest || !ev.target.closest('#list')) ev.preventDefault();
+  }, { passive: false });
+
+
+  // ---- swipe to dismiss ------------------------------------------------------
+  // Drag the card left or right past 35% of its width (or flick it) to dismiss it.
+  // A your_turn leaves the pending list; any other card is hidden until the next event.
+  const SWIPE_FRACTION = 0.35, FLICK_V = 0.5, FLICK_MIN_PX = 30, AXIS_PX = 10, EDGE_PX = 20;
+  const MAX_TILT_DEG = 8, TOAST_MS = 5000, NOTE_MS = 2500, FLY_MS = 220, FADE_MS = 160;
+  const reduceMotion = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
+  let drag = null, dragFrame = 0, swiped = false, toastTimer = null, lastDismiss = null;
+
+  // What a swipe on the card now would dismiss, or null when nothing can be.
+  function dismissTarget() {
+    if (pinnedId != null || document.body.classList.contains('drawer')) return null;
+    const e = displayed();
+    if (!e || e.idle || e.dismissed) return null;
+    if (mainCard && e.id === cardEvent(mainCard).id) {
+      return { key: e.id, body: { session: mainCard.session }, working: mainCard.state === 'working' };
+    }
+    if (typeof e.id === 'number') return { key: `ev:${e.id}`, body: { event_id: e.id }, eventId: e.id };
+    return null;
+  }
+
+  function post(path, body) {
+    return fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      cache: 'no-store', credentials: 'same-origin',
+    }).then((r) => r.status, () => 0);
+  }
+
+  function cardStyle(transform, opacity, transition) {
+    const c = $('card');
+    c.style.transition = transition || 'none';
+    c.style.transform = transform;
+    c.style.opacity = opacity;
+  }
+
+  function paintDrag() {
+    dragFrame = 0;
+    if (!drag || drag.axis !== 'x') return;
+    const w = $('card').clientWidth || window.innerWidth;
+    const p = drag.dx / (w * SWIPE_FRACTION);
+    const opacity = String(Math.max(0.25, 1 - Math.abs(p) * 0.45));
+    if (reduceMotion.matches) cardStyle('', opacity);
+    else cardStyle(`translateX(${drag.dx}px) rotate(${Math.max(-1.5, Math.min(1.5, p)) * MAX_TILT_DEG}deg)`, opacity);
+  }
+
+  function dragStart(id, x, y, target) {
+    if (drag || x < EDGE_PX || (target && target.closest && target.closest('button'))) return;
+    const t = dismissTarget();
+    if (!t) return;
+    const now = performance.now();
+    drag = { id, x0: x, y0: y, x, t: now, dx: 0, vx: 0, axis: null, target: t };
+  }
+
+  function dragMove(id, x, y, ev) {
+    if (!drag || drag.id !== id) return;
+    const dx = x - drag.x0, dy = y - drag.y0;
+    if (!drag.axis) {
+      if (Math.abs(dx) < AXIS_PX && Math.abs(dy) < AXIS_PX) return;
+      drag.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+      if (drag.axis === 'y') { drag = null; return; } // the drawer's gesture
+      swiped = true;
+    }
+    if (ev && ev.cancelable) ev.preventDefault();
+    const now = performance.now(), dt = now - drag.t;
+    if (dt > 0) drag.vx = 0.7 * ((x - drag.x) / dt) + 0.3 * drag.vx;
+    drag.x = x; drag.t = now; drag.dx = dx;
+    if (!dragFrame) dragFrame = requestAnimationFrame(paintDrag);
+  }
+
+  function dragEnd(id, cancelled) {
+    if (!drag || drag.id !== id) return;
+    const d = drag; drag = null;
+    if (dragFrame) { cancelAnimationFrame(dragFrame); dragFrame = 0; }
+    if (d.axis !== 'x') return;
+    // Swallow the click that can follow the gesture.
+    setTimeout(() => { swiped = false; }, 350);
+    const w = $('card').clientWidth || window.innerWidth;
+    const far = Math.abs(d.dx) >= w * SWIPE_FRACTION;
+    const flick = Math.abs(d.vx) > FLICK_V && Math.abs(d.dx) > FLICK_MIN_PX && Math.sign(d.vx) === Math.sign(d.dx);
+    if (!cancelled && (far || flick)) flyOut(d, Math.sign(d.dx) || 1, w);
+    else springBack();
+  }
+
+  function springBack() {
+    if (reduceMotion.matches) cardStyle('', '', 'opacity .15s linear');
+    else cardStyle('', '', 'transform .25s cubic-bezier(.2,.8,.3,1), opacity .25s ease-out');
+  }
+
+  function flyOut(d, dir, w) {
+    const motion = !reduceMotion.matches;
+    if (motion) cardStyle(`translateX(${dir * w * 1.3}px) rotate(${dir * MAX_TILT_DEG * 1.6}deg)`, '0',
+                          `transform ${FLY_MS}ms ease-in, opacity ${FLY_MS}ms ease-in`);
+    else cardStyle('', '0', `opacity ${FADE_MS}ms linear`);
+    dismiss(d.target);
+    setTimeout(() => {
+      // The next card (or the idle screen) fades in where the old one was.
+      cardStyle('', '0');
+      render();
+      requestAnimationFrame(() => cardStyle('', '1', `opacity ${FADE_MS}ms ease-out`));
+    }, motion ? FLY_MS : FADE_MS);
+  }
+
+  // Applies the dismissal on this page at once, then asks the daemon.
+  function dismiss(t) {
+    const undo = { t, prevKey: dismissedKey, prevLocal: localHidden, req: null };
+    if (t.eventId) localHidden = t.eventId;
+    else {
+      dismissedKey = t.key;
+      if (t.working) { const cur = latestReal(); if (cur) localHidden = cur.id; }
+    }
+    lastDismiss = undo;
+    showToast('Dismissed', true, TOAST_MS);
+    undo.req = post('/v1/dismiss', t.body).then((status) => {
+      if (status === 200) return true;
+      if (lastDismiss === undo) { revert(undo); showToast("Couldn't dismiss", false, NOTE_MS); }
+      return false;
+    });
+  }
+
+  function revert(u) {
+    dismissedKey = u.prevKey; localHidden = u.prevLocal; lastDismiss = null;
+    queueRender();
+  }
+
+  async function undoDismiss() {
+    const u = lastDismiss;
+    hideToast();
+    if (!u) return;
+    revert(u);
+    if (!(await u.req)) return;
+    const status = await post('/v1/undismiss', u.t.body);
+    if (status !== 200) {
+      // Too late or the card changed: the dismissal stands.
+      if (u.t.eventId) localHidden = u.t.eventId; else dismissedKey = u.t.key;
+      queueRender();
+      showToast("Can't undo", false, NOTE_MS);
+    }
+  }
+
+  function showToast(text, withUndo, ms) {
+    clearTimeout(toastTimer);
+    $('toastmsg').textContent = text;
+    $('undo').hidden = !withUndo;
+    $('toast').hidden = false;
+    toastTimer = setTimeout(() => {
+      hideToast();
+      if (withUndo) lastDismiss = null; // after 5 s the dismissal is final
+    }, ms);
+  }
+  function hideToast() { clearTimeout(toastTimer); toastTimer = null; $('toast').hidden = true; }
+  $('undo').addEventListener('click', (ev) => { ev.stopPropagation(); undoDismiss(); });
+
+  (function bindSwipe() {
+    const c = $('card');
+    if (window.PointerEvent) {
+      c.addEventListener('pointerdown', (ev) => {
+        if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+        dragStart(ev.pointerId, ev.clientX, ev.clientY, ev.target);
+      });
+      c.addEventListener('pointermove', (ev) => dragMove(ev.pointerId, ev.clientX, ev.clientY, ev), { passive: false });
+      c.addEventListener('pointerup', (ev) => dragEnd(ev.pointerId, false));
+      c.addEventListener('pointercancel', (ev) => dragEnd(ev.pointerId, true));
+    } else {
+      const t0 = (ev) => ev.changedTouches[0];
+      c.addEventListener('touchstart', (ev) => {
+        const t = t0(ev); dragStart(t.identifier, t.clientX, t.clientY, ev.target);
+      }, { passive: true });
+      c.addEventListener('touchmove', (ev) => {
+        const t = t0(ev); dragMove(t.identifier, t.clientX, t.clientY, ev);
+      }, { passive: false });
+      c.addEventListener('touchend', (ev) => dragEnd(t0(ev).identifier, false));
+      c.addEventListener('touchcancel', (ev) => dragEnd(t0(ev).identifier, true));
+    }
+  })();
+
+  // ---- sound cue -------------------------------------------------------------
+  // A short two-note chime when a new your_turn arrives live. iOS only lets a page make sound
+  // after a user gesture, so the first tap anywhere unlocks it; a hint shows until then.
+  const LS_SOUND = 'nearpush.sound';
+  const AC = window.AudioContext || window.webkitAudioContext || null;
+  let soundOn = localStorage.getItem(LS_SOUND) !== '0';
+  let audio = null;
+  const chimed = new Set(); // your_turn event ids already handled
+
+  function audioReady() { return !!audio && audio.state === 'running'; }
+  function updateSound() {
+    const b = $('sound');
+    b.classList.toggle('off', !soundOn);
+    b.setAttribute('aria-pressed', String(soundOn));
+    b.title = soundOn ? 'sound on' : 'sound off';
+    $('soundhint').hidden = !(soundOn && AC && !audioReady());
+  }
+  // Plays through the ring/silent switch where Safari supports the Audio Session API.
+  function playbackSession() {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch { /* unsupported */ }
+  }
+  function unlockAudio() {
+    if (!soundOn || !AC || audioReady()) return;
+    playbackSession();
+    try {
+      if (!audio) { audio = new AC(); audio.onstatechange = updateSound; }
+      // A silent one-sample buffer started inside the gesture unlocks output on iOS.
+      const src = audio.createBufferSource();
+      src.buffer = audio.createBuffer(1, 1, 22050);
+      src.connect(audio.destination);
+      src.start(0);
+      Promise.resolve(audio.resume()).then(updateSound, updateSound);
+    } catch { /* no audio on this device */ }
+    updateSound();
+  }
+  function chimeNotes() {
+    const t = audio.currentTime + 0.01;
+    // E5 then A5, sine, ~300 ms in all, with soft attack and decay.
+    [[659.25, 0, 0.16], [880, 0.12, 0.18]].forEach(([freq, at, dur]) => {
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(freq, t + at);
+      g.gain.setValueAtTime(0.0001, t + at);
+      g.gain.exponentialRampToValueAtTime(0.2, t + at + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + at + dur);
+      o.connect(g); g.connect(audio.destination);
+      o.start(t + at); o.stop(t + at + dur + 0.02);
+    });
+  }
+  function playChime() {
+    if (!audio) return; // never unlocked: the hint is showing
+    try {
+      playbackSession();
+      if (audioReady()) { chimeNotes(); return; }
+      // Suspended after the page was in the background: try to resume, else wait for a tap.
+      Promise.resolve(audio.resume()).then(() => {
+        updateSound();
+        if (audioReady() && soundOn && document.visibilityState === 'visible') chimeNotes();
+      }, updateSound);
+    } catch { /* audio failed: stay silent */ }
+  }
+  // A live event this page has not seen before.
+  function cue(e) {
+    if (!e || e.state !== 'your_turn' || e.dismissed || chimed.has(e.id)) return;
+    chimed.add(e.id);
+    if (soundOn && document.visibilityState === 'visible') playChime();
+  }
+  $('sound').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    soundOn = !soundOn;
+    try { localStorage.setItem(LS_SOUND, soundOn ? '1' : '0'); } catch { /* storage disabled */ }
+    unlockAudio();
+    updateSound();
+  });
+  document.addEventListener('touchend', unlockAudio, { passive: true });
+  document.addEventListener('click', unlockAudio, true);
+  updateSound();
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(fit, 80); });
+  window.addEventListener('orientationchange', () => setTimeout(fit, 250));
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
+
+  render();
+  connect();
+  requestWake();
+})();
+</script>
+</body>
+</html>

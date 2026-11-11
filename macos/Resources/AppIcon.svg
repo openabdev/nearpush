@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Nearpush app icon. macOS (Big Sur+) grid: 824 px body, 100 px margin, 185 px corner radius. -->
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#161618"/>
+      <stop offset="1" stop-color="#0A0A0B"/>
+    </linearGradient>
+    <linearGradient id="highlight" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- card -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#card)"/>
+  <!-- faint top highlight -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#highlight)"/>
+  <!-- hairline edge so the card separates from a dark Dock -->
+  <rect x="102" y="102" width="820" height="820" rx="183" ry="183" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="4"/>
+
+  <!-- asterisk: six rounded arms, centred slightly low-left to make room for the arcs -->
+  <g stroke="#E5484D" stroke-width="96" stroke-linecap="round" fill="none">
+    <path d="M468 386 L468 654"/>
+    <path d="M352 453 L584 587"/>
+    <path d="M352 587 L584 453"/>
+  </g>
+
+  <!-- push arcs: two concentric quarter-arcs upper right, centred on the asterisk -->
+  <g stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="52" stroke-linecap="round" fill="none">
+    <path d="M534.26 272.72 A256 256 0 0 1 715.28 453.74"/>
+    <path d="M561.17 172.27 A360 360 0 0 1 815.73 426.83"/>
+  </g>
+</svg>

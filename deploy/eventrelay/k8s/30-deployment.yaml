@@ -1,0 +1,98 @@
+# Secrets are referenced by name only. Create them with the commands in ../README.md.
+# Secret volumes use defaultMode 0440 with fsGroup 65532. kubelet writes secret files as root,
+# so group 65532 read access is the closest in-pod equivalent of 0600 for uid 65532.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eventrelay
+  namespace: example-relay
+  labels:
+    app: eventrelay
+spec:
+  replicas: 1
+  # SQLite lives on a ReadWriteOnce volume, so two pods must never run at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: eventrelay
+  template:
+    metadata:
+      labels:
+        app: eventrelay
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: eventrelay
+          # Built on a build host and imported into the k3s node's containerd. Never pull from a registry.
+          image: docker.io/library/eventrelay:0.1.0
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: EVENTRELAY_DB
+              value: /data/eventrelay.db
+            - name: EVENTRELAY_SOURCE_TOKENS_FILE
+              value: /secrets/source/source-tokens
+            - name: EVENTRELAY_CONSUMER_TOKEN_FILE
+              value: /secrets/consumer/consumer-token
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: source-tokens
+              mountPath: /secrets/source
+              readOnly: true
+            - name: consumer-token
+              mountPath: /secrets/consumer
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: eventrelay-data
+        - name: source-tokens
+          secret:
+            secretName: eventrelay-source-tokens
+            defaultMode: 0440
+            items:
+              - key: source-tokens
+                path: source-tokens
+        - name: consumer-token
+          secret:
+            secretName: eventrelay-consumer-token
+            defaultMode: 0440
+            items:
+              - key: consumer-token
+                path: consumer-token

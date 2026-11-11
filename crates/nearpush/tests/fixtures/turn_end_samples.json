@@ -1,0 +1,82 @@
+[
+  {
+    "text": "我已經回覆那個 step 了，照方案 2 進行：\n\n1. 不空等： 今天的 nightly 要再等約 14 小時才會自己跑，所以改成現在手動觸發 example-service 的 nightly build，每 3 分鐘查一次結果。如果又失敗（上次是 arm64 出錯），它會停下來告訴你原因。\n2. 確認 image： build 成功後，先確認新的 nightly image 有包含 abc1234。\n3. 輪流重建： 從 node-a 開始，一個一個 restart 5 個 StatefulSet。每個都要確認 Ready、有上 tailnet，NetworkPolicy 也還在，才換下一個。\n4. 驗證 smoke test： 全部換完後會再停一次，跟你要 node-a 的 admin credential 來驗證。\n\n要注意，restart 時你的 terminal session \"main\" 會斷線一次，2 個 bot 也會各重啟一次。",
+    "expected": "all_set"
+  },
+  {
+    "text": "全部換完後會再停一次，跟你要 node-a 的 admin credential 來驗證。",
+    "expected": "all_set"
+  },
+  {
+    "text": "Plan: restart the three pods one at a time.\n4. Verify the smoke test. Once everything is done I will need your admin credential.",
+    "expected": "all_set"
+  },
+  {
+    "text": "All changes are in.\nOnce everything is done I will need your admin credential to verify the smoke test.",
+    "expected": "all_set"
+  },
+  {
+    "text": "Going with option 2:\n1. Restart node-a first\n2. Restart the rest. Once everything is done I will need your admin credential.",
+    "expected": "all_set"
+  },
+  {
+    "text": "已改好：hook 不再暫停。\n\n如果你想現在就清掉，我再做一次短暫的解除暫停測試。",
+    "expected": "all_set"
+  },
+  {
+    "text": "測試通過，已 commit。\n總結如上。",
+    "expected": "all_set"
+  },
+  {
+    "text": "前面那則被判成 your turn，原因是句中的「跟我說」命中了規則。\n這次只改了分類方式，其他行為不變。",
+    "expected": "all_set"
+  },
+  {
+    "text": "Done. If you'd like, I can also clean up the stash afterwards.",
+    "expected": "all_set"
+  },
+  {
+    "text": "The earlier turn showed your turn because the phrase \"let me know\" matched.\nI changed the matcher to skip quoted text.",
+    "expected": "all_set"
+  },
+  {
+    "text": "兩個方案：\n1. 用 SMAppService\n2. 用子程序\n請選一個，我等你選擇後再繼續。",
+    "expected": "your_turn"
+  },
+  {
+    "text": "Two options:\n1. Use SMAppService\n2. Use a subprocess\nI'll wait for your choice.",
+    "expected": "your_turn"
+  },
+  {
+    "text": "測試通過，已 commit。\n要我 ship 嗎？",
+    "expected": "your_turn"
+  },
+  {
+    "text": "Pushed the fix.\nShould I also bump the version?",
+    "expected": "your_turn"
+  },
+  {
+    "text": "Which option do you want?\n1. A\n2. B",
+    "expected": "your_turn"
+  },
+  {
+    "text": "全部完成後會再停一次，要不要現在就 ship？\n我等你回覆。",
+    "expected": "your_turn"
+  },
+  {
+    "text": "Choose one:\n1. Ship now\n2. Ship later",
+    "expected": "your_turn"
+  },
+  {
+    "text": "全部完成後，我會問你要不要 ship。",
+    "expected": "all_set"
+  },
+  {
+    "text": "Restarts are done. Once that is done I will ask: do you want to ship.",
+    "expected": "all_set"
+  },
+  {
+    "text": "之後要不要 ship？",
+    "expected": "your_turn"
+  }
+]

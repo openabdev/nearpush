@@ -1,0 +1,22 @@
+{
+  "hooks": [
+    {
+      "name": "nearpush-prompt",
+      "trigger": "UserPromptSubmit",
+      "action": { "type": "command", "command": "~/.local/bin/nearpush hook" },
+      "timeout_ms": 3000
+    },
+    {
+      "name": "nearpush-stop",
+      "trigger": "Stop",
+      "action": { "type": "command", "command": "~/.local/bin/nearpush hook" },
+      "timeout_ms": 3000
+    },
+    {
+      "name": "nearpush-end",
+      "trigger": "SessionEnd",
+      "action": { "type": "command", "command": "~/.local/bin/nearpush hook" },
+      "timeout_ms": 3000
+    }
+  ]
+}

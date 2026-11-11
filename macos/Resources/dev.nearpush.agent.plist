@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.nearpush.agent</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/nearpushd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>nearpushd</string>
+		<string>--log-file</string>
+		<string>~/Library/Logs/nearpush/nearpushd.log</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restart on crash only. nearpushd exits 0 when 127.0.0.1:8787 is taken,
+	     so a second daemon never crash-loops against the port. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>dev.nearpush.app</string>
+	</array>
+</dict>
+</plist>

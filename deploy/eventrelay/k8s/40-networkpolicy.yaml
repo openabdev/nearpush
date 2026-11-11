@@ -1,0 +1,24 @@
+# Ingress to the relay is allowed only from pods in the producer-ns namespace, on TCP 8080.
+# No other ingress rule is defined. Egress is not restricted by this policy.
+# If `tailscale serve` on the k3s node cannot reach the Service because the host source address is
+# denied, the deploy step adds an ipBlock for that single host address and records it in
+# README.md. Do not widen this policy without recording the reason.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eventrelay-ingress
+  namespace: example-relay
+spec:
+  podSelector:
+    matchLabels:
+      app: eventrelay
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: producer-ns
+      ports:
+        - protocol: TCP
+          port: 8080
