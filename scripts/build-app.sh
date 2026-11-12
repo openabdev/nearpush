@@ -47,6 +47,9 @@ cp macos/Resources/dev.nearpush.agent.plist "$APP/Contents/Library/LaunchAgents/
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 plutil -lint "$APP/Contents/Info.plist" "$APP/Contents/Library/LaunchAgents/dev.nearpush.agent.plist"
+for key in CFBundleShortVersionString CFBundleVersion; do
+  [ "$(plutil -extract "$key" raw "$APP/Contents/Info.plist")" = "$VERSION" ] || { echo "build-app.sh: $key in Info.plist is not $VERSION" >&2; exit 1; }
+done
 
 echo "==> codesign ($SIGN)"
 # Inner code first, then the bundle; no --deep.
@@ -55,10 +58,11 @@ codesign --force --sign "$SIGN" --timestamp=none "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 
 cp target/release/nearpush "$ROOT/build/nearpush"
-rm -f "$ROOT/build/Nearpush.zip"
-ditto -c -k --keepParent "$APP" "$ROOT/build/Nearpush.zip"
+ZIP="$ROOT/build/Nearpush-$VERSION-macos-arm64.zip"
+rm -f "$ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
 echo
 echo "app:  $APP"
-echo "zip:  $ROOT/build/Nearpush.zip"
+echo "zip:  $ZIP"
 echo "cli:  $ROOT/build/nearpush"

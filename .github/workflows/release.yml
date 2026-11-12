@@ -3,87 +3,103 @@ name: release-macos
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version label for the artifact zip name (dry run, no release is created)"
-        type: string
-        default: dryrun
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: macos-15
+    timeout-minutes: 45
     env:
       # scripts/build-app.sh refuses to build unless the host matches NEARPUSH_BUILD_HOST
       # or this is set. The runner is the build host here, so allow it.
       NEARPUSH_ALLOW_LOCAL_BUILD: "1"
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Resolve version
         id: ver
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="$INPUT_VERSION"
-          fi
-          if ! printf '%s' "$version" | grep -Eq '^[A-Za-z0-9._-]+$'; then
-            echo "invalid version: $version" >&2
+          version=$(awk '
+            /^\[workspace\.package\]/ { inpkg = 1; next }
+            /^\[/ { inpkg = 0 }
+            inpkg && /^version[[:space:]]*=/ { gsub(/.*=[[:space:]]*"|".*/, ""); print; exit }
+          ' Cargo.toml)
+          if ! printf '%s' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            echo "Cargo.toml [workspace.package] version is not semver: '$version'" >&2
             exit 1
           fi
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version v$version" >&2
+            exit 1
+          fi
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
-      - name: Build Nearpush.app
-        run: scripts/build-app.sh
-
-      - name: Package zip
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
+      - name: Run tests
         run: |
           set -euo pipefail
-          test -x build/Nearpush.app/Contents/MacOS/Nearpush
-          test -x build/Nearpush.app/Contents/MacOS/nearpushd
-          mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent build/Nearpush.app "dist/Nearpush-${VERSION}-macos.zip"
+          cargo test --workspace
+          (cd macos && swift test)
 
-      - uses: actions/upload-artifact@v4
+      - name: Build Nearpush.app and zip
+        run: scripts/build-app.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: Nearpush-${{ steps.ver.outputs.version }}-macos
-          path: dist/Nearpush-${{ steps.ver.outputs.version }}-macos.zip
+          name: Nearpush-${{ steps.ver.outputs.version }}-macos-arm64
+          path: build/Nearpush-${{ steps.ver.outputs.version }}-macos-arm64.zip
           if-no-files-found: error
 
   release:
     if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
-      ZIP: dist/Nearpush-${{ needs.build.outputs.version }}-macos.zip
+      VERSION: ${{ needs.build.outputs.version }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: Nearpush-${{ needs.build.outputs.version }}-macos
+          name: Nearpush-${{ needs.build.outputs.version }}-macos-arm64
           path: dist
 
-      - name: Create or update release
+      - name: Publish release
         run: |
           set -euo pipefail
+          asset="Nearpush-${VERSION}-macos-arm64.zip"
+          test -f "dist/$asset"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$ZIP" --clobber
+            if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -Fxq "$asset"; then
+              echo "asset $asset already exists on release $TAG; refusing to overwrite it. Delete that asset on GitHub before re-running." >&2
+              exit 1
+            fi
+            gh release upload "$TAG" "dist/$asset"
           else
-            gh release create "$TAG" "$ZIP" --verify-tag --title "$TAG" --generate-notes
+            if [ "$PRERELEASE" = "true" ]; then
+              gh release create "$TAG" "dist/$asset" --verify-tag --title "$TAG" --generate-notes --prerelease
+            else
+              gh release create "$TAG" "dist/$asset" --verify-tag --title "$TAG" --generate-notes
+            fi
           fi
