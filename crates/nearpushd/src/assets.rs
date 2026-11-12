@@ -13,9 +13,11 @@ pub const ICON_192: &[u8] = include_bytes!("../assets/icon-192.png");
 pub const ICON_512: &[u8] = include_bytes!("../assets/icon-512.png");
 /// Official Kiro logo, from https://kiro.dev/icon.svg.
 pub const KIRO_SVG: &[u8] = include_bytes!("../assets/icons/kiro.svg");
+/// auth-proxy sender mark (a shield with a keyhole), drawn for this repo.
+pub const AUTH_PROXY_SVG: &[u8] = include_bytes!("../assets/icons/auth-proxy.svg");
 
 /// Built-in sender icons, used when no user override exists.
-const BUILTIN_ICONS: &[(&str, &[u8])] = &[("kiro", KIRO_SVG)];
+const BUILTIN_ICONS: &[(&str, &[u8])] = &[("kiro", KIRO_SVG), ("auth-proxy", AUTH_PROXY_SVG)];
 
 pub const SVG: &str = "image/svg+xml";
 pub const PNG: &str = "image/png";
@@ -107,6 +109,7 @@ mod tests {
         let d = Some(dir.path());
         // Built-in, then generic.
         assert_eq!(resolve_icon(d, "kiro").unwrap().source, IconSource::Builtin);
+        assert_eq!(resolve_icon(d, "auth-proxy").unwrap().source, IconSource::Builtin);
         let g = resolve_icon(d, "cli").unwrap();
         assert_eq!((g.source, g.content_type), (IconSource::Generic, SVG));
         assert!(std::str::from_utf8(&g.bytes).unwrap().contains(">C</text>"));
