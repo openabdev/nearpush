@@ -1,0 +1,89 @@
+name: release-macos
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the artifact zip name (dry run, no release is created)"
+        type: string
+        default: dryrun
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      # scripts/build-app.sh refuses to build unless the host matches NEARPUSH_BUILD_HOST
+      # or this is set. The runner is the build host here, so allow it.
+      NEARPUSH_ALLOW_LOCAL_BUILD: "1"
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$INPUT_VERSION"
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "invalid version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build Nearpush.app
+        run: scripts/build-app.sh
+
+      - name: Package zip
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -x build/Nearpush.app/Contents/MacOS/Nearpush
+          test -x build/Nearpush.app/Contents/MacOS/nearpushd
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent build/Nearpush.app "dist/Nearpush-${VERSION}-macos.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nearpush-${{ steps.ver.outputs.version }}-macos
+          path: dist/Nearpush-${{ steps.ver.outputs.version }}-macos.zip
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      ZIP: dist/Nearpush-${{ needs.build.outputs.version }}-macos.zip
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Nearpush-${{ needs.build.outputs.version }}-macos
+          path: dist
+
+      - name: Create or update release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" --clobber
+          else
+            gh release create "$TAG" "$ZIP" --verify-tag --title "$TAG" --generate-notes
+          fi

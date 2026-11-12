@@ -50,6 +50,14 @@ mkdir -p ~/.local/bin
 scp <build-host>:~/repo/nearpush/target/release/{nearpushd,nearpush} ~/.local/bin/
 ```
 
+## Releases
+
+`.github/workflows/release.yml` builds the macOS app on a GitHub-hosted arm64 runner.
+
+- Pushing a tag `vX.Y.Z` builds `Nearpush.app` and publishes a GitHub release for that tag with
+  `Nearpush-X.Y.Z-macos.zip` attached. The build is ad-hoc signed and not notarized.
+- `workflow_dispatch` is a dry run: it uploads the zip as a workflow artifact and creates no release.
+
 ## Files
 
 | Path | What |
