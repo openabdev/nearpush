@@ -50,6 +50,30 @@ mkdir -p ~/.local/bin
 scp <build-host>:~/repo/nearpush/target/release/{nearpushd,nearpush} ~/.local/bin/
 ```
 
+## Releases
+
+`.github/workflows/release.yml` builds the macOS app on a GitHub-hosted arm64 runner.
+
+- The version is `[workspace.package] version` in `Cargo.toml`. Pushing a tag runs the build only
+  when the tag is exactly `v` plus that version. Otherwise the run fails.
+- The tests (`cargo test --workspace` and `swift test`) run before the app is built.
+- A tag with a hyphen, such as `v0.4.0-rc1`, publishes as a prerelease.
+- The release attaches `Nearpush-X.Y.Z-macos-arm64.zip`. An existing asset is never overwritten:
+  the run fails with a message instead.
+- `workflow_dispatch` is a dry run: it runs the tests and uploads the zip as a workflow artifact.
+  It creates no release.
+
+### Release note: arm64 only, ad-hoc signed, not notarized
+
+- The app runs on Apple silicon (arm64) Macs only. Intel Macs cannot run it.
+- The app is ad-hoc signed and not notarized. Gatekeeper blocks the first launch of a
+  browser-downloaded copy. To open it on macOS 15:
+  1. Move `Nearpush.app` to `/Applications` and try to open it once. macOS blocks it.
+  2. Open System Settings → Privacy & Security, find the message about Nearpush, click
+     **Open Anyway**, and confirm with your password.
+- Or remove the quarantine flag in Terminal:
+  `xattr -dr com.apple.quarantine /Applications/Nearpush.app`
+
 ## Files
 
 | Path | What |
@@ -231,7 +255,7 @@ install it on the laptop:
 ```sh
 rsync -a --delete --exclude target/ --exclude .build/ --exclude .agents/ --exclude .git/ --exclude build/ ./ <build-host>:~/repo/nearpush/
 ssh <build-host> 'cd ~/repo/nearpush && export PATH=$HOME/.cargo/bin:$PATH && NEARPUSH_BUILD_HOST="<build-host-glob>" scripts/build-app.sh'
-scp <build-host>:~/repo/nearpush/build/Nearpush.zip "$TMPDIR"/ && ditto -x -k "$TMPDIR"/Nearpush.zip ~/Applications/
+scp '<build-host>:~/repo/nearpush/build/Nearpush-*-macos-arm64.zip' "$TMPDIR"/ && ditto -x -k "$TMPDIR"/Nearpush-*-macos-arm64.zip ~/Applications/
 scp <build-host>:~/repo/nearpush/build/nearpush ~/.local/bin/nearpush   # the matching CLI
 open ~/Applications/Nearpush.app
 ```
