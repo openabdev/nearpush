@@ -26,6 +26,8 @@ VERSION=$(awk '
   inpkg && /^version[[:space:]]*=/ { gsub(/.*=[[:space:]]*"|".*/, ""); print; exit }
 ' Cargo.toml)
 [ -n "$VERSION" ] || { echo "build-app.sh: cannot read [workspace.package] version" >&2; exit 1; }
+# Bundle keys need dotted integers, so they take the core x.y.z; the full SemVer stays in the zip name.
+BUNDLE_VERSION=${VERSION%%[-+]*}
 SIGN="${SIGN_ID:--}"
 
 echo "==> cargo build --release (nearpushd, nearpush) $VERSION"
@@ -41,14 +43,14 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Library/LaunchAgents" "$APP/Contents/Resources"
 cp "$SWIFT_BIN/Nearpush" "$APP/Contents/MacOS/Nearpush"
 cp target/release/nearpushd "$APP/Contents/MacOS/nearpushd"
-sed "s/@VERSION@/$VERSION/g" macos/Resources/Info.plist > "$APP/Contents/Info.plist"
+sed "s/@VERSION@/$BUNDLE_VERSION/g" macos/Resources/Info.plist > "$APP/Contents/Info.plist"
 cp macos/Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp macos/Resources/dev.nearpush.agent.plist "$APP/Contents/Library/LaunchAgents/dev.nearpush.agent.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 plutil -lint "$APP/Contents/Info.plist" "$APP/Contents/Library/LaunchAgents/dev.nearpush.agent.plist"
 for key in CFBundleShortVersionString CFBundleVersion; do
-  [ "$(plutil -extract "$key" raw "$APP/Contents/Info.plist")" = "$VERSION" ] || { echo "build-app.sh: $key in Info.plist is not $VERSION" >&2; exit 1; }
+  [ "$(plutil -extract "$key" raw "$APP/Contents/Info.plist")" = "$BUNDLE_VERSION" ] || { echo "build-app.sh: $key in Info.plist is not $BUNDLE_VERSION" >&2; exit 1; }
 done
 
 echo "==> codesign ($SIGN)"

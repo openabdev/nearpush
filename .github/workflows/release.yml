@@ -31,20 +31,17 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
-          version=$(awk '
-            /^\[workspace\.package\]/ { inpkg = 1; next }
-            /^\[/ { inpkg = 0 }
-            inpkg && /^version[[:space:]]*=/ { gsub(/.*=[[:space:]]*"|".*/, ""); print; exit }
-          ' Cargo.toml)
-          if ! printf '%s' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
-            echo "Cargo.toml [workspace.package] version is not semver: '$version'" >&2
-            exit 1
-          fi
+          # Cargo parses the workspace version with its SemVer parser, so a malformed
+          # version fails here instead of passing through a hand-written pattern.
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '
+            [.packages[].version] | unique
+            | if length == 1 then .[0] else error("workspace members disagree on version") end')
           if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version v$version" >&2
             exit 1
           fi
-          case "$version" in
+          # A prerelease is a hyphen before any build metadata ("+...").
+          case "${version%%+*}" in
             *-*) prerelease=true ;;
             *) prerelease=false ;;
           esac

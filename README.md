@@ -255,7 +255,7 @@ install it on the laptop:
 ```sh
 rsync -a --delete --exclude target/ --exclude .build/ --exclude .agents/ --exclude .git/ --exclude build/ ./ <build-host>:~/repo/nearpush/
 ssh <build-host> 'cd ~/repo/nearpush && export PATH=$HOME/.cargo/bin:$PATH && NEARPUSH_BUILD_HOST="<build-host-glob>" scripts/build-app.sh'
-scp <build-host>:~/repo/nearpush/build/Nearpush.zip "$TMPDIR"/ && ditto -x -k "$TMPDIR"/Nearpush.zip ~/Applications/
+scp '<build-host>:~/repo/nearpush/build/Nearpush-*-macos-arm64.zip' "$TMPDIR"/ && ditto -x -k "$TMPDIR"/Nearpush-*-macos-arm64.zip ~/Applications/
 scp <build-host>:~/repo/nearpush/build/nearpush ~/.local/bin/nearpush   # the matching CLI
 open ~/Applications/Nearpush.app
 ```
