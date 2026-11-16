@@ -33,31 +33,64 @@ flowchart LR
   originates from the owner's host.
 - **The card** carries a one-line summary and the approval-plane link as its
   `--url`. It never carries the request body, a credential, or an approve
-  action.
+  action. Where the text comes from matters, because a tap opens the link:
+  the notifier builds `--url` only from its own approval-plane base URL
+  plus the request id, never from fields the caller supplied, and
+  `--title` is caller-influenced summary text — fine for the owner to
+  read, never an authorization signal.
 - **The approval plane** is a separate surface (PWA or native app) holding the
   owner's signing key. Tapping the card opens it; nothing about the signature
   or the decision passes through nearpush.
 
 ## The contract
 
-One parked request is one card, sender `auth-proxy` (which has a built-in
+Each parked request gets a card, sender `auth-proxy` (which has a built-in
 icon, a shield mark). The notifier keeps the event id that `nearpush send`
-prints and follows the request to its outcome:
+prints — the number on its `sent event #<id>` line:
+
+```sh
+id=$(nearpush send --sender auth-proxy --app auth-proxy --state allow \
+  --title "<one-line summary>" \
+  --url "<approval-plane link for this request>" \
+  | sed -n 's/^sent event #//p')
+```
+
+and follows the request to its outcome:
 
 | auth-proxy event | nearpush action |
 |---|---|
-| request parked | `nearpush send --sender auth-proxy --app auth-proxy --state allow --title "<one-line summary>" --url "<approval-plane link for this request>"` |
-| approved and executed | dismiss the `allow.` card, then `nearpush send --sender auth-proxy --state all_set --title "<summary> — done"` |
+| request parked | the `nearpush send` above |
+| approved and executed | dismiss the `allow.` card, then `nearpush send --sender auth-proxy --app auth-proxy --state all_set --title "<summary> — done"` |
 | denied | dismiss the `allow.` card (no replacement card; a denial needs no attention) |
 | expired with no decision | dismiss the `allow.` card, so a dead request never lingers as if it were actionable |
 
-Dismissal from the notifier uses the loopback path with the push token:
+Two limits of the display shape what "one card per request" can mean:
+
+- **Only the newest parked request is on the card.** The main card shows
+  one event at a time, and dismissal is a high-water mark, not a per-event
+  flag: dismissing a newer event also hides every older one. When several
+  requests are parked at once, the approval plane's own queue is the
+  source of truth for what is still pending — the card points at the
+  newest request, it is not the queue. (Per-event hiding would be a
+  separate change.)
+- **A pending session hides the card.** While any session is waiting on
+  the owner (`your_turn`), or one is shown as `working.`, the main card
+  shows that session instead of the event stream, so an `allow.` card may
+  not be visible until the session resolves. The request is unaffected:
+  it stays parked in auth-proxy and still expires on its own schedule.
+
+Dismissal from the notifier uses the loopback path with the push token.
+A `404` here means the card is already gone — a viewer dismissed it, or a
+newer event's dismissal hid it — which is the state the notifier wanted
+anyway, so it treats `404` as success:
 
 ```sh
-curl -s http://127.0.0.1:8787/v1/dismiss \
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/v1/dismiss \
   -H "Authorization: Bearer $(cat ~/.config/nearpush/token)" \
   -H 'Content-Type: application/json' \
-  -d "{\"event_id\": <id printed by nearpush send>}"
+  -d "{\"event_id\": $id}")
+# 200: dismissed now. 404: already gone. Both are success.
+[ "$code" = 200 ] || [ "$code" = 404 ]
 ```
 
 ## One approval, end to end
