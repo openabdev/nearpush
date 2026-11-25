@@ -1,7 +1,7 @@
 {
   "name": "nearpush push spike",
   "short_name": "np-spike",
-  "start_url": "/",
+  "start_url": "/?v=2",
   "scope": "/",
   "display": "standalone",
   "background_color": "#000000",

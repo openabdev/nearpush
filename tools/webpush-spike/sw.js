@@ -1,3 +1,4 @@
+// v2
 // Spike service worker: show every push as a notification (iOS requires a
 // visible notification for each push, or it revokes the subscription).
 self.addEventListener("install", () => self.skipWaiting());
