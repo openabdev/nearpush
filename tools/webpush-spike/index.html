@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.webmanifest?v=2">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<title>np-spike</title>
+<style>
+body{background:#000;color:#eee;font:17px -apple-system,sans-serif;padding:24px}
+button{font-size:20px;padding:14px 20px;border-radius:12px;border:0;background:#0a84ff;color:#fff}
+pre{white-space:pre-wrap;font-size:13px;color:#9f9}
+</style>
+</head>
+<body>
+<h2>np-spike v2 (port 8450)</h2>
+<button id="sub">Enable notifications</button>
+<p id="mode"></p>
+<pre id="out"></pre>
+<script>
+window.onerror = (m, src, l, c) => say("JS error: " + m + " @" + l + ":" + c);
+window.onunhandledrejection = (e) => say("unhandled rejection: " + (e.reason && e.reason.message || e.reason));
+const out = document.getElementById("out");
+function say(m) {
+  out.textContent += m + "\n";
+  fetch("/client-log", { method: "POST", body: m }).catch(() => {});
+}
+const standalone = window.navigator.standalone === true ||
+  matchMedia("(display-mode: standalone)").matches;
+document.getElementById("mode").textContent = "standalone: " + standalone;
+say("page v2 origin=" + location.origin);
+say("navigator.standalone=" + window.navigator.standalone);
+say("display-mode standalone=" + matchMedia("(display-mode: standalone)").matches);
+say("'serviceWorker' in navigator=" + ("serviceWorker" in navigator));
+say("'PushManager' in window=" + ("PushManager" in window));
+say("typeof Notification=" + typeof Notification +
+    (typeof Notification !== "undefined" ? " permission=" + Notification.permission : ""));
+say("UA=" + navigator.userAgent);
+
+function b64u(s) {
+  const p = "=".repeat((4 - s.length % 4) % 4);
+  const r = atob((s + p).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(r, (c) => c.charCodeAt(0));
+}
+
+let reg;
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js?v=2").then((r) => { reg = r; say("sw registered"); })
+    .catch((e) => say("sw error " + e));
+}
+
+document.getElementById("sub").onclick = async () => {
+  try {
+    if (typeof Notification === "undefined") { say("no Notification API: open from Home Screen, iOS 16.4+"); return; }
+    const perm = await Notification.requestPermission();
+    say("permission=" + perm);
+    if (perm !== "granted") return;
+    reg = reg || await navigator.serviceWorker.ready;
+    const { key } = await (await fetch("/vapid")).json();
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64u(key) });
+    const r = await fetch("/subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub) });
+    say("subscribed endpoint host=" + new URL(sub.endpoint).host + " server=" + r.status);
+  } catch (e) {
+    say("subscribe error " + e);
+  }
+};
+</script>
+</body>
+</html>

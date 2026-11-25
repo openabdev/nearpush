@@ -1,0 +1,13 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {"id": "F1", "severity": "MEDIUM", "reviewer": "sol", "title": "Lane result step can lock SubSet twice and deadlock", "fix": "Two-phase apply: under the lock, validate (id, rev), update memory and compute an action (None/Persist/Remove(expect_rev)); release the guard, then persist() or remove_sub(id, Some(rev)); add a race test against a key-changing upsert"},
+    {"id": "F2", "severity": "LOW", "reviewer": "sol", "title": "Unclear meaning of a 500 when a route save fails", "fix": "Either roll back on save failure or keep the change, mark dirty and retry the flush; test a forced write failure plus restart for subscribe and unsubscribe"},
+    {"id": "F3", "severity": "LOW", "reviewer": "sol", "title": "Invalid P-256 scalar probability is about 2^-32, not 2^-128", "fix": "Correct the number"},
+    {"id": "F4", "severity": "LOW", "reviewer": "opus5", "title": "rand_core/getrandom is enabled through aes-gcm defaults via feature unification", "fix": "Reword the reason or use SigningKey::random(&mut OsRng)"},
+    {"id": "F5", "severity": "LOW", "reviewer": "opus5", "title": "Wrong list of shared lockfile risks (serde_json is dev-only, serde is off)", "fix": "List http ^1.4.2 and the aes-gcm/hkdf 0.13/sha2 0.11 dependencies instead"},
+    {"id": "F6", "severity": "LOW", "reviewer": "opus5", "title": "/sw.js response headers not specified", "fix": "Serve /sw.js with page_headers(\"text/javascript\", \"no-cache\") or an equivalent that includes img-src 'self'"},
+    {"id": "F7", "severity": "LOW", "reviewer": "opus5", "title": "Lane host check must use the same EndpointPolicy as subscribe", "fix": "Both checks call one policy object"}
+  ],
+  "reviewDoc": ".agents/tasks/apple-watch-webpush/council-review.md"
+}
