@@ -1,12 +1,14 @@
 # Design: Apple Watch support through Web Push to the home-screen web app
 
-Status: draft for council review, round 3. Base: `eventrelay` @ 89c8b673. Evidence:
+Status: draft for council review, round 4. Base: `eventrelay` @ 89c8b673. Evidence:
 [spike-report.md](spike-report.md) (Q1 PASS, Q2 PASS, both observed on pahud's carried
 iPhone, iOS 18.7, with a paired Apple Watch). Nothing here is implemented or merged.
 
 Two decisions are left to pahud and are not made here: which devices receive pushes
 (Q3, see "Open decisions"), and whether the default payload text should be the
-summary-or-tag default argued below or something else (D2).
+summary-or-tag default argued below or something else (D2). One verification item is
+also open: whether Declarative Web Push supports a per-push icon or a custom summary
+(O1).
 
 ## Overview
 
@@ -45,10 +47,16 @@ relay puller (origin_ms) ───────────┴▶ accept_event �
     Pure Rust (p256, aes-gcm, hkdf, ece-native).
   - `p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8", "pem"] }`, the
     same major version web-push-native uses, for the VAPID key and the ES256 JWT.
-    These features do not enable `rand_core/getrandom`, so key generation does not use
-    `SigningKey::random(&mut OsRng)`. It fills 32 bytes with the existing `getrandom`
-    dependency, calls `SigningKey::from_bytes(&bytes.into())`, and retries on `Err` (a
-    zero or out-of-range scalar, probability about 2^-128). ES256 signing uses
+    Key generation fills 32 bytes with the existing `getrandom` dependency, calls
+    `SigningKey::from_bytes(&bytes.into())`, and retries on `Err` (a zero or
+    out-of-range scalar; for P-256 a uniform 32-byte value is out of range with
+    probability `(2^256 − n) / 2^256`, about 2^-32). In the built graph
+    `rand_core/getrandom` is in fact enabled: web-push-native's `encrypt()` calls
+    `SecretKey::random(&mut OsRng)` and pulls aes-gcm with its default features, which
+    include `getrandom`, and Cargo unifies features. `SigningKey::random(&mut OsRng)`
+    would therefore compile too. The design keeps `from_bytes` over `getrandom` so the
+    VAPID key path depends only on nearpushd's own direct dependency and not on a
+    feature that another crate happens to turn on. ES256 signing uses
     `signature::Signer::sign`, which is deterministic (RFC 6979) and needs no RNG.
   - `base64ct = { version = "1", features = ["alloc"] }` for base64url.
   - `http = "1"` (already in the tree through axum) to adjust the built request.
@@ -79,9 +87,13 @@ relay puller (origin_ms) ───────────┴▶ accept_event �
   option, raising the workspace and the Dockerfile to 1.87, was rejected: it changes the
   relay image for a feature the relay does not use, and it forces a relay rebuild and p1
   import that this feature does not otherwise need.
-- **The shared lockfile is the remaining risk.** web-push-native raises the locked
-  versions of crates that eventrelay also uses (`serde ^1.0.229`, `serde_json ^1.0.151`,
-  `http ^1.4.2`). If one of those declares an MSRV above 1.85, the relay's `--locked`
+- **The shared lockfile is the remaining risk.** web-push-native 0.5.0 can raise the
+  locked versions of crates that eventrelay also uses. Its normal dependencies that can
+  move shared lock entries are `http ^1.4.2` and the trees under `aes-gcm`, `hkdf 0.13`
+  and `sha2 0.11` (for example `rand_core`, `getrandom`, `generic-array`, `subtle`,
+  `cpufeatures`) wherever eventrelay locks the same crate. `serde_json` is only a
+  dev-dependency of web-push-native, and `serde` is optional and off under
+  `default-features = false`, so neither is moved by it. If one of the moved crates declares an MSRV above 1.85, the relay's `--locked`
   build on 1.85 fails. The implementation plan therefore has a gate step: build
   eventrelay with `--locked` on rustc 1.85 (step 2). On failure, the fix is to pin the
   offending crate in `Cargo.lock` to the newest version that builds on 1.85
@@ -201,7 +213,7 @@ truncated so the JSON is at most 960 bytes, and then padded with a `"p"` field o
 `aes128gcm` header), and Apple cannot read label length from it. Apple allows 4 KiB.
 
 ```json
-{"v":1,"id":123,"state":"your_turn","title":"your turn","body":"#ab12 · frontend","tag":"np-3f9a0c1e7b2d4a58","url":"/","p":"000…"}
+{"v":1,"id":123,"state":"your_turn","title":"✋ your turn","body":"#ab12 · frontend","tag":"np-3f9a0c1e7b2d4a58","url":"/","p":"000…"}
 ```
 
 What the code puts in each field today (checked against the base):
@@ -221,9 +233,24 @@ What the code puts in each field today (checked against the base):
 
 Fields:
 
-- `title`: fixed per state, `your turn` / `allow?` / `all set`. Never the event title.
+- `title`: fixed per state, a fixed symbol followed by a short state word:
+
+  | State | Title |
+  |---|---|
+  | `your_turn` | `✋ your turn` |
+  | `all_set` | `✅ all set` |
+  | `allow` | `❓ allow?` |
+
+  Never the event title, and never task text. These three strings were tested to render
+  on the Watch (docs/apple-watch.md, "Title convention"). The reason for the rule: every
+  Watch summary shows the same manifest icon and the title, so the title is the only
+  per-push text that tells the states apart at a glance. The strings live in one table
+  in `webpush.rs` that the payload builder uses; `sw.js` shows the payload title as it
+  is and adds no prefix of its own. The docs page and the payload use the same three
+  strings. The page's live card headline (`your turn.` etc.) does not change. The detail
+  stays in `body` and is governed by `content` below.
 - `body`, by `[webpush] content`:
-  - `"state"`: empty. The Watch shows only "nearpush: your turn"-style text.
+  - `"state"`: empty. The Watch shows only the title, e.g. `✋ your turn`.
   - `"summary"` (default): the summarized label if `ctx.summary` is set, otherwise the
     session tag `#xxxx` (the page's own `sessionTag` rule: last 4 alphanumerics of the
     session), then `project`, joined with ` · `, cut to 120 characters with an
@@ -308,8 +335,8 @@ It ties subscriptions to the key that created them.
   403 anyway).
 - Writes happen on subscribe, unsubscribe, removal, and when a send result changes
   `last_ok_ms` by more than 10 minutes or changes `last_error_class`, so a busy session
-  does not rewrite the file on every push. In-memory state is authoritative; a failed
-  background write logs an error and is retried on the next change.
+  does not rewrite the file on every push. In-memory state is authoritative; see "Save
+  failures" below for what happens when a write fails.
 
 **One writer at a time.** The in-memory set lives in a `std::sync::Mutex<SubSet>` that is
 only held for short in-memory updates, never across I/O. Every save, from route
@@ -317,13 +344,57 @@ handlers and from lanes, goes through `WebPush::persist()`:
 
 1. acquire `save_lock` (a `tokio::sync::Mutex<()>`, the same pattern as `control_write`);
 2. under the `SubSet` lock, serialize a snapshot to bytes, then release that lock;
-3. write tmp, fsync, rename inside `spawn_blocking`;
+3. write tmp, fsync, rename inside `spawn_blocking`, through the `write_atomic` function
+   that `WebPush` holds (the real file writer in production; integration tests
+   construct `WebPush` with one that fails on demand, which is how save failures are
+   tested);
 4. release `save_lock`.
 
 Because the snapshot is taken after `save_lock` is held, the last save to finish writes
 the newest state, and no two writers ever share the tmp path. Route handlers await
-`persist()` so they can return 500 on failure; lanes await it too (a short disk write
+`persist()` so they can report a failed save; lanes await it too (a short disk write
 inside one lane does not delay the others).
+
+**Lock order.** There are three locks: `save_lock` (tokio), the `SubSet` mutex (std) and
+the `ControlState` `RwLock`. The rules, enforced in `webpush.rs` by code shape and by the
+review checklist of the implementation PR:
+
+1. `save_lock` is only ever taken while no `SubSet` guard is held, and it is the only
+   lock held across an `.await`. Order, when both are held: `save_lock` first, then
+   `SubSet`, and only inside `persist()` step 2.
+2. A `SubSet` guard is never held across an `.await`, never held while taking
+   `save_lock`, and never held while calling `persist()`, `remove_sub()`, `add_sub()`,
+   `test_all()` or any other `WebPush` method that takes `SubSet` itself. Code that holds
+   the guard only reads and writes fields, clones values out, and returns a plain value.
+   Each such section is a small synchronous function that receives `&mut SubSet` and no
+   `&WebPush` (`fn …(&mut SubSet, …) -> …`), so it cannot `.await` and has no handle to
+   any other lock.
+3. `ControlState` is read, copied out and released before the `SubSet` lock is taken;
+   the two are never held together.
+
+**Save failures (one rule for routes and lanes).** A change is applied in memory first
+and kept when the save fails; it is never rolled back. A failed save sets a `dirty` flag
+in `WebPush`, logs an error, and wakes a flush task that calls `persist()` again after
+30 s, then every 30 s while `dirty` is set (each failure logged at most once per minute).
+Any later successful `persist()`, from a route, a lane or the flush task, clears `dirty`.
+`/status` shows `webpush.dirty`. For the routes this means:
+
+- `subscribe`, `unsubscribe` and `remove` return 500
+  `{"error":"cannot save webpush.json","applied":true}` when the save fails. The 500
+  says: the change is live now, and it is lost if the daemon stops before a later save
+  succeeds.
+- Why not roll back: undoing a removal would have to recreate a lane, and undoing an
+  upsert would have to restore the old keys and `rev` while other changes may have
+  happened in between. Keeping the change gives one simple meaning, and both lossy
+  cases heal on their own:
+  - A subscribe lost by a restart is relearned on the device's next page load (the
+    on-load re-POST, match branch).
+  - An unsubscribe or remove lost by a restart brings the old record back. Its next
+    push gets 404/410 from Apple, because the browser has already unsubscribed, and the
+    lane removes it. Until then at most one push goes to a dead endpoint, which shows
+    nothing anywhere.
+- The page treats a subscribe 500 with `applied:true` as "notifications on (not saved
+  yet)" and does not retry; the next load re-POSTs anyway.
 
 ## HTTP routes
 
@@ -335,7 +406,7 @@ that carries pahud's login header.
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `GET /sw.js` | viewer | service worker, `text/javascript`, `Cache-Control: no-cache` |
+| `GET /sw.js` | viewer | service worker, served with `page_headers("text/javascript", "no-cache")` (see below) |
 | `GET /webpush/key` | viewer | `{"enabled":bool,"key":"<b64url public key>"|null,"key_id":…}` |
 | `POST /webpush/subscribe` | viewer + Origin required and matching + `Content-Type: application/json` | upsert a subscription |
 | `POST /webpush/unsubscribe` | viewer + same Origin rule | `{"endpoint":…}` removes it |
@@ -381,7 +452,7 @@ the entry is `gone`. Response 200:
 - Never the endpoint, its host or path, the keys or any response body. With no
   subscriptions the result list is empty. When disabled: 409 `{"error":"web push is disabled"}`.
 
-`GET /status` gains a `webpush` object: `enabled`, `key_id`, `sent`, `failed`,
+`GET /status` gains a `webpush` object: `enabled`, `key_id`, `dirty`, `sent`, `failed`,
 `dropped_rate`, `dropped_queue`, `dropped_stale`, `dropped_paused`, `last_ok_ms`, `last_error_class`, and
 `subscriptions` as `[{id, label, login, endpoint_host, created_ms, last_ok_ms,
 last_error_class}]`. No endpoint path, no keys. The Swift `DaemonStatus` decoder ignores
@@ -389,6 +460,12 @@ unknown keys, so the menu app needs no change in this phase.
 
 CSP (`page_headers`) adds `worker-src 'self'`. Without it `default-src 'none'` blocks
 the service worker registration, because `script-src` allows only inline scripts.
+`/sw.js` is served through the same `page_headers("text/javascript", "no-cache")` as the
+page, not with a separate header set. A service worker runs under the CSP of its own
+script response, and that CSP already contains `img-src 'self'`, so the notification
+`icon: /icon-192.png` may load. A bare `default-src 'none'` on `/sw.js` would block it.
+An integration test checks that the `/sw.js` response carries `img-src 'self'` and
+`Cache-Control: no-cache`.
 `assets::ui_version()` hashes `sw.js` too, so a changed worker also reloads the page.
 
 When `[webpush] enabled = false`: `/sw.js` is still served (the page may already have a
@@ -420,6 +497,21 @@ and `notify` is a no-op.
 The endpoint allowlist is the SSRF defence: the daemon only ever posts to hosts in
 `endpoint_hosts`, with redirects off. Error responses from this route never echo the
 submitted endpoint.
+
+**One `EndpointPolicy` for both checks.** The endpoint rule in the table (scheme, no
+userinfo, port, host) is implemented once, as `EndpointPolicy::check(&Url) ->
+Result<(), EndpointRejected>`. `WebPush` holds exactly one `EndpointPolicy`, built at
+construction: in production from `endpoint_hosts` (https only, port 443 only). The
+integration tests pass a policy built with `EndpointPolicy::with_loopback_http(port)`,
+which additionally admits `http://127.0.0.1:<port>`. That constructor is a public
+function of the `nearpushd` library (integration tests in `tests/` link the library and
+cannot see `#[cfg(test)]` items), and it is reachable only by Rust code: `main.rs`
+builds the policy from `endpoint_hosts` and has no path to it, and config cannot name
+it. The
+subscribe route and lane step 4 both call `webpush.endpoint_policy().check(..)` on that
+same object, so the mock tests and production go through the same code path with
+different data, and a hand-edited `webpush.json` is held to the same rule as a new
+subscription.
 
 Success: 200 `{"id":…,"created":bool}`. `login` is taken from the request's
 `Tailscale-User-Login` header (or `"loopback"` with the local-testing flag), not from
@@ -461,7 +553,12 @@ before rolling back (same as `[filter]`/`[hook]` today).
 - `push`: parse JSON; on any parse failure use title `nearpush` and an empty body. It
   **always** calls `showNotification` inside `event.waitUntil`, because iOS revokes a
   subscription whose pushes show nothing. Options: `body`, `tag`, `icon: /icon-192.png`,
-  `data: {url}`. The `p` filler is ignored.
+  `data: {url}`. The `p` filler is ignored. The title is the payload's `title` as is (see
+  the title table under "Payload and privacy"); the parse-failure fallback `nearpush` is
+  the only title not from that table. On the Watch the summary shows the manifest icon;
+  a per-push `icon` is reported not to be honoured (docs/apple-watch.md), so `icon` is
+  kept for the iPhone banner only and nothing relies on it. Whether Declarative Web Push
+  changes this is open item O1.
 - `notificationclick`: close, then focus an existing client or `openWindow('/')`. The
   page then reconnects with `since=<lastId>` and replays as today.
 - No `fetch` handler: the worker never caches or intercepts the page.
@@ -531,8 +628,10 @@ every lane sender in a snapshot taken under the `SubSet` lock.
   does not create, replace or restart a lane.
 - **Lanes are removed only by `WebPush::remove_sub(id, expect_rev: Option<u64>)`.**
   Under the `SubSet` lock it removes the record and the lane sender together, but only
-  if the record exists and, when `expect_rev` is `Some`, its `rev` still equals it.
-  Then it calls `persist()`. The unsubscribe and remove routes call it with `None`.
+  if the record exists and, when `expect_rev` is `Some`, its `rev` still equals it. It
+  then releases the `SubSet` guard and, only if it removed something, awaits
+  `persist()`. It is an `async fn` and must be called with no `SubSet` guard held (see
+  "Lock order"). It returns whether it removed the record. The unsubscribe and remove routes call it with `None`.
   A lane calls it with `Some(rev it sent with)` after 404/410 or an encryption error,
   so an old send cannot remove a record whose keys were replaced meanwhile. If the new
   keys hit the same 410, the next send removes the record with the new rev.
@@ -551,22 +650,45 @@ Lane task, per job:
    (`dropped_rate` or `rate_limited`).
 3. `WebPushBuilder::new(endpoint_uri, p256dh, auth).with_valid_duration(ttl).build(payload)`.
    An error here is class `encryption`.
-4. Re-check the endpoint host against `endpoint_hosts` (the authoritative SSRF check:
-   a hand-edited `webpush.json` must not bypass it).
+4. Re-check the endpoint with the same `EndpointPolicy::check` the subscribe route uses
+   (the authoritative SSRF check: a hand-edited `webpush.json` must not bypass it). A
+   rejected endpoint is class `rejected`, the job is dropped and the record is kept,
+   logged at error with the id and host.
 5. Add `Authorization: vapid t=…, k=…` (JWT cached per endpoint origin, renewed when
    less than 1 h of its 12 h remains) and `Urgency: high`.
 6. Convert to `reqwest::Request`, send with the dedicated client, classify the status,
    and count `sent` or `failed`. The response body is dropped unread.
 7. On network error or 5xx, sleep 2 s and repeat once from step 1. The retry therefore
    re-reads the record and re-checks age, pause and filter.
-8. Apply the result under the `SubSet` lock, by `id`:
-   - id gone (removed during the send): change nothing, do not persist. A test reply
+8. Apply the result in two phases, so no lock is held across an `.await` and no
+   `WebPush` method is called with the `SubSet` guard held (see "Lock order").
+
+   **Phase A, under the `SubSet` lock, synchronous.** A function
+   `apply_result(&mut SubSet, id, rev, &SendOutcome, now) -> ResultAction` looks the
+   record up by `id`:
+   - id gone (removed during the send): change nothing, return `None`. A test reply
      carries the send's own status and class.
    - `rev` differs from the one read in step 1 (keys replaced during the send): change
-     nothing, do not remove. A test reply is `superseded`.
-   - otherwise: on 404/410 or an encryption error call `remove_sub(id, Some(rev))` and
-     exit; on 429 set `hold_until`; update `last_ok_ms` / `last_error_class` and call
-     `persist()` if the write rule says so. Reply on the oneshot if this is a test job.
+     nothing, return `None`. A test reply is `superseded`.
+   - otherwise, on 404/410 or an encryption error: change nothing, return
+     `Remove(rev)`.
+   - otherwise: on 429 set `hold_until` (lane-local state, not in `SubSet`, so it is set
+     after phase A); update `last_ok_ms` / `last_error_class`; return `Persist` if the
+     write rule says so, else `None`.
+
+   The guard is dropped when the function returns.
+
+   **Phase B, no lock held.**
+   - `None`: nothing.
+   - `Persist`: await `persist()`. A failure follows "Save failures" (sets `dirty`).
+   - `Remove(rev)`: await `remove_sub(id, Some(rev))`. It repeats the compare under the
+     lock, so it stays the final compare-and-remove: if an upsert changed the keys
+     between phase A and phase B, the record's `rev` no longer equals `rev`, nothing is
+     removed, and the lane keeps running for the new keys (a test reply is then
+     `superseded`). If it removed the record, the lane exits after replying.
+
+   The test reply, if this is a test job, is sent after phase B, so its class reflects
+   what phase B did.
 
 ## Error handling
 
@@ -578,7 +700,8 @@ Lane task, per job:
 | `webpush.json` load | missing | yes | empty set | none |
 | `webpush.json` load | unparseable | yes | moved to `.bad-<ms>`, empty set | error |
 | `webpush.json` load | `key_id` mismatch | yes | subscriptions discarded | warn |
-| `webpush.json` save | I/O error | yes | subscribe/unsubscribe/remove return 500 `cannot save webpush.json`; background saves retry on the next change | error |
+| `webpush.json` save | I/O error | yes | the change stays applied in memory; `dirty` set; flush task retries every 30 s. subscribe/unsubscribe/remove return 500 `{"error":"cannot save webpush.json","applied":true}` (live now, lost if the daemon stops before a later save succeeds); lanes continue | error, at most once per minute while `dirty` |
+| lane: endpoint check | `EndpointPolicy::check` rejects a stored endpoint (hand-edited file) | no automatic fix | job dropped, class `rejected`, record kept | error with id and host |
 | `notify` | queue full | yes | nothing (push dropped), `dropped_queue` += 1 | warn, at most once per minute |
 | dispatcher / lane | event older than `ttl_secs` | yes | dropped, `dropped_stale` += 1 | debug |
 | lane | paused, or the state left the display filter, while the job waited | yes | event job dropped, `dropped_paused` += 1 (test jobs exempt) | debug |
@@ -608,8 +731,12 @@ person who needs Apple's reason can reproduce with `/webpush/test` and a debugge
   Enforced in `server.rs` by the existing `authorize_viewer` / `authorize_local`. The
   daemon still binds loopback only (`Config::validate`).
 - **The daemon only posts to allowed push hosts.** Enforced at subscribe time
-  (validation) and again in the lane before each send. The lane check is the
-  authoritative one.
+  (validation) and again in the lane before each send, both through the one
+  `EndpointPolicy` that `WebPush` holds. The lane check is the authoritative one.
+- **No deadlock between `save_lock`, `SubSet` and `ControlState`.** Enforced in
+  `webpush.rs` by the "Lock order" rules: `SubSet` guards live only inside synchronous
+  functions over `&mut SubSet`, and `persist()` / `remove_sub()` are called with no
+  guard held. Covered by the two-phase race test.
 - **`working`, generic, paused and stale events never push.** Enforced in
   `webpush::should_push`, the only caller of the queue, with unit tests; staleness,
   pause and filter are re-checked in the lane. Config validation rejects `working` as a second layer.
@@ -636,7 +763,8 @@ person who needs Apple's reason can reproduce with `/webpush/test` and a debugge
 
 ### Q3: desk iPhone SE vs carried iPhone
 
-Not decided here. The base design sets no default for the SE: it neither enrolls the SE
+Still open after round 4; this revision does not decide it. The base design sets no
+default for the SE: it neither enrolls the SE
 nor blocks it. Nothing is pushed to any device until someone taps **Enable
 notifications** on it. The storage, sender and routes are the same under every option;
 only the README wording and, for one variant of A, one config key differ.
@@ -657,6 +785,21 @@ wording (and `allowed_labels`, only if A with enforcement is picked) waits for i
 The design defaults to `content = "summary"` for the reasons in "Payload and privacy".
 pahud may pick `"state"` (no task text at all) or `"label"` (raw first prompt line until
 a summary exists) instead. Only the default string changes.
+
+## Open items (verification, not decisions)
+
+### O1: Declarative Web Push icon and summary support is unverified
+
+Declarative Web Push lets Safari on iOS show a notification straight from a JSON payload
+without running the service worker. Whether it supports a per-push icon or
+a custom Watch summary (instead of the manifest icon and the fallback text
+`Notification` the spike saw) is not verified. This design does not use Declarative Web
+Push: it sends a classic encrypted payload that `sw.js` turns into a notification, which
+is what the spike proved on the Watch. Nothing in the implementation depends on O1. If a
+later check shows Declarative Web Push gives a per-state icon or summary on the Watch,
+adopting it is a separate design change (a different payload shape and a different iOS
+code path), not a tweak to this one. Until then the title table above is the only
+per-state signal on the Watch.
 
 ## Testability
 
@@ -685,6 +828,23 @@ Unit tests (in `webpush.rs`, `relay.rs` and `config.rs`, run on macmini):
   a result with an old `rev` changes nothing.
 - VAPID key generation: `from_bytes` over `getrandom` output yields a key that
   round-trips through PKCS#8 PEM; a zero scalar is rejected and retried.
+- payload titles: each state's title is exactly `✋ your turn`, `✅ all set` or
+  `❓ allow?`, under every `content` level; no task text ever appears in `title`; the
+  1024-byte length holds with the multi-byte prefixes.
+- lock order: `apply_result` over a plain `SubSet` (no `WebPush`, no runtime) returns
+  `None` for a removed id, `None` for a changed `rev`, `Remove(rev)` for 410 and for an
+  encryption error, and `Persist` only when the write rule says so.
+- two-phase race (tokio test with a paused clock and a test hook between phase A and
+  phase B): (1) a 410 result whose phase A returned `Remove(rev)` races an upsert that
+  changes the keys before phase B; `remove_sub` removes nothing, the record keeps the new
+  keys, and the lane keeps running. (2) A result that returned `Persist` races an upsert
+  plus its route `persist()`; both saves finish, the file equals the final in-memory set.
+  Both cases run under a 5 s `tokio::time::timeout`, so a reintroduced self-deadlock fails
+  the test instead of hanging it.
+- save failures: with an injected writer fault, subscribe and unsubscribe return 500
+  with `applied:true`, the in-memory set reflects the change and `/status` shows
+  `dirty:true`; after the fault clears, the flush task writes the file within 30 s and
+  `dirty` clears.
 - response classification: 201 ok, 404/410 remove, 429 with and without `Retry-After`,
   403 keep, 5xx retry once.
 - VAPID: create → file 0600, reload gives the same `key_id`; the JWT's `aud` equals the
@@ -744,6 +904,18 @@ a real listener):
   removed while its test send is open is still listed; one added after the call starts
   is not listed.
 - `/status` lists the subscription with `endpoint_host` and no endpoint path or keys.
+- `/sw.js` response headers: `Content-Type: text/javascript`, `Cache-Control: no-cache`,
+  and a CSP containing `img-src 'self'` and `worker-src 'self'`.
+- one `EndpointPolicy`: with the production policy, a subscribe for
+  `http://127.0.0.1:<port>` is 400; with the loopback test policy it is accepted and the
+  push reaches the mock; a record hand-edited into `webpush.json` with a host outside the
+  policy is never posted to (class `rejected`, the mock sees no request).
+- save failure then restart: the state dir is made unwritable (or a writer fault is
+  injected), a subscribe returns 500 `applied:true`, the daemon is restarted before the
+  fault clears, and the subscription is absent; the page's next on-load re-POST (simulated)
+  stores it again. Same for unsubscribe: after restart the old record is back, and its
+  next push gets 410 from the mock and removes it. A third case clears the fault before
+  the restart and checks that both changes survived.
 
 Independent checks of the VAPID and encryption wire format (the unit tests above cannot
 catch a wrong `aud` format or a header encoding mistake, because they check the code
@@ -761,7 +933,8 @@ against itself):
    the laptop because it is Python, not a Rust build.
 
 Device acceptance (manual, real iPhone + Watch, after pahud approves touching the live
-setup): repeat spike Q1 on the production origin for all three states, and record
+setup): repeat spike Q1 on the production origin for all three states, check that the
+Watch shows each title exactly as in the title table, and record
 whether the page's on-load check found `options.applicationServerKey` (the match
 branch) or took the missing-key branch.
 
@@ -846,3 +1019,18 @@ branch) or took the missing-key branch.
 | 7 | Page re-POSTs before the `applicationServerKey` check, so an old-key subscription is stored again after rotation (opus5, LOW) | Addressed. On load the page compares `subscription.options.applicationServerKey` with `/webpush/key` first and re-POSTs only on a match. On a mismatch it unsubscribes locally and on the daemon. If iOS does not expose the key, the page does not re-POST; device acceptance records which branch iOS takes. |
 | 8 | An 8-hex tag prefix does not guarantee uniqueness (sol, LOW) | Addressed. The tag uses 16 hex characters (64 bits). The "cannot collide" claim is removed, and the accepted risk is stated (about n²/2^65; the effect is one notification replacing another). |
 | 9 | `p256` without `rand_core/getrandom` makes `SigningKey::random(&mut OsRng)` fail to compile (opus5, LOW note) | Addressed. Key generation fills 32 bytes with `getrandom`, calls `SigningKey::from_bytes`, and retries on an invalid scalar. Signing is RFC 6979 deterministic, so it needs no RNG. A unit test is added. |
+
+## Review responses (round 3)
+
+| # | Finding (source) | Response |
+|---|---|---|
+| 1 | Lane result step holds the `SubSet` lock while calling `remove_sub` and the async `persist()`, which take `SubSet` themselves: self-deadlock, and a std guard held across `.await` (sol, MEDIUM; council F1) | Addressed. Lane step 8 is now two-phase. Phase A is a synchronous `apply_result(&mut SubSet, …) -> ResultAction` that validates `(id, rev)`, updates in-memory fields and returns `None`, `Persist` or `Remove(rev)`; the guard drops on return. Phase B, with no lock held, awaits `persist()` or `remove_sub(id, Some(rev))`, which repeats the compare and stays the final compare-and-remove. A new "Lock order" section fixes the order (`save_lock` before `SubSet`, only inside `persist()`; no `SubSet` guard across `.await` or around any `WebPush` call; `ControlState` never held with `SubSet`), and a new invariant names who enforces it. Tests added: `apply_result` unit table, and a two-phase race test (Remove and Persist each racing a key-changing upsert) under a 5 s timeout so a deadlock fails instead of hanging. |
+| 2 | A 500 from subscribe/unsubscribe/remove after a failed save has no defined meaning; a lost unsubscribe can come back after restart (sol, LOW; council F2) | Addressed with one rule: keep the change, never roll back. A failed save sets `dirty`, a flush task retries every 30 s, `/status` shows `dirty`, and the routes return 500 `{"error":"cannot save webpush.json","applied":true}`, documented as "live now, lost if the daemon stops before a later save succeeds". Rollback was rejected (it would have to recreate lanes and restore old keys and `rev`). Both lossy cases heal: a lost subscribe is re-POSTed on the next page load, and a resurrected unsubscribed record is removed by its first 410. `persist()` writes through an injectable `write_atomic`; integration tests force a write failure, restart, and check subscribe and unsubscribe, plus a case where the fault clears before restart. |
+| 3 | Invalid-scalar probability stated as 2^-128 (sol, LOW; council F3) | Addressed. Corrected to `(2^256 − n) / 2^256`, about 2^-32. Retrying stays. |
+| 4 | Claim that p256's features do not enable `rand_core/getrandom` is wrong in the built graph (opus5, LOW; council F4) | Addressed. The text now says feature unification turns it on (web-push-native's `encrypt()` uses `OsRng`, aes-gcm default features include `getrandom`). The `from_bytes`-over-`getrandom` approach is kept, with the reason reworded: the VAPID key path should depend only on nearpushd's own direct dependency, not on a feature another crate enables. |
+| 5 | Shared lockfile risk list names crates that are not shared (opus5, LOW; council F5) | Addressed. The list is now `http ^1.4.2` and the trees under aes-gcm, hkdf 0.13 and sha2 0.11; `serde_json` (dev-dependency only) and `serde` (optional, off) are named as not moved. The plan step 2 gate is unchanged. |
+| 6 | `/sw.js` response headers not specified; the icon needs `img-src 'self'` in the worker's own CSP (opus5, LOW; council F6) | Addressed. `/sw.js` is served with `page_headers("text/javascript", "no-cache")`, whose CSP includes `img-src 'self'` and the new `worker-src 'self'`. Integration test on the response headers added. |
+| 7 | Lane host check and subscribe validation must use one `EndpointPolicy` (opus5, LOW note; council F7) | Addressed. `EndpointPolicy::check` implements the endpoint rule once; `WebPush` holds one policy (from `endpoint_hosts` in production, `with_loopback_http(port)` in tests, unreachable from config), and both the subscribe route and lane step 4 call it. A stored endpoint the policy rejects is class `rejected` and is never posted to. Integration test covers both policies and a hand-edited record. |
+| 8 | Title convention from the Watch test (pahud, docs/apple-watch.md) | Added. Titles are a fixed symbol plus a short state word, `✋ your turn`, `✅ all set`, `❓ allow?`, from one table in `webpush.rs`; `sw.js` shows them as is; the body keeps the detail under `content`. Unit test and a device-acceptance check added. |
+| 9 | Declarative Web Push icon/summary support (pahud, docs/apple-watch.md open item) | Added as open item O1: unverified. The design does not use Declarative Web Push and nothing depends on it; adopting it later is a separate design change. |
+| 10 | Q3 (desk SE) | Unchanged: stays open with options A, B and C and no default. D2 also stays open. |
