@@ -159,8 +159,11 @@ after a crash does not push twice.
 
 - `relay::RelayEvent` gains `#[serde(default)] received_ms: Option<u64>`. eventrelay
   already sends it (`crates/eventrelay/src/http.rs:156`).
-- `NewEvent` gains `#[serde(skip)] pub origin_ms: Option<u64>`, set only by
-  `to_new_event` from `received_ms`, like `relay_id`. Clients cannot send it.
+- `NewEvent` gains `#[serde(skip)] pub origin_ms: Option<u64>`, set only by the relay
+  puller: `relay::run` sets `new.origin_ms = ev.received_ms` after either converter
+  succeeds (`to_new_event` for push-shaped bodies, `kiro_to_new_event` for Kiro adapter
+  bodies), so the freshness check applies to every relay-sourced event regardless of
+  converter. Clients cannot send it.
   `Event` and `events.jsonl` do not change.
 - In `commit()`, `origin_ms = new.origin_ms.unwrap_or(ev.ts)`. A direct `POST /push`
   is therefore "now". A relay event without `received_ms` (an older relay) is also
@@ -521,6 +524,12 @@ order:
 `subscribe` and `unsubscribe` both call it right after `authorize_viewer`, so both
 require a present, matching `Origin` and a JSON content type. `authorize_dismiss` is not
 changed in this work. `check_origin` alone is never used for a `/webpush/*` route.
+Because `check_origin` logs `rejected cross-origin websocket`, the helper does not rely
+on that line: on a step-2 failure it logs its own warn `rejected cross-origin webpush
+request` (path only, no headers). The check is unconditional, unlike dismiss's
+login-only branch, so local-testing callers (login `"loopback"`) must also send
+`Origin` with a matching `Host` on subscribe and unsubscribe, and the integration tests
+set both headers.
 
 **`POST /webpush/test` path.** Test pushes do not go through `notify` or the
 dispatcher, so coalescing cannot drop them and each one has its own reply channel.
@@ -988,7 +997,8 @@ Unit tests (in `webpush.rs`, `relay.rs` and `config.rs`, run on macmini):
 - `should_push` truth table: muted, no state, each state, `working`, filter excludes,
   `[webpush] states` excludes, age 0, age = `ttl_secs` (pushes), age = `ttl_secs` + 1
   (does not), origin in the future (age 0).
-- `to_new_event` copies `received_ms` into `origin_ms`; a body cannot set `origin_ms`
+- `relay::run` sets `origin_ms` from `received_ms` for both converters (a push-shaped
+  body and a Kiro adapter `stop` body with an `event` key); a body cannot set `origin_ms`
   (unknown-field rejection, like `relay_id`); a page without `received_ms` gives `None`.
 - payload builder: each `content` level; `"summary"` with and without `ctx.summary`
   (falls back to the tag, never the raw `session_label`); truncation with ellipsis on
@@ -1084,7 +1094,8 @@ a real listener):
   timeout fires), the second answers 201. The second mock receives the push within 2 s
   of `POST /push`, and a second `POST /push` 1 s later also reaches it promptly.
 - stale relay event: the mock relay serves a page with `received_ms` = now − 1 h; the
-  card appears through the stream and the push mock receives no request. A page with
+  card appears through the stream and the push mock receives no request. Run once with a
+  push-shaped body and once with a Kiro adapter `stop` body (`event` key). A page with
   `received_ms` = now − 10 s is pushed.
 - log hygiene: the push mock answers 400 and 500 with a body that contains the request
   path, the received `Authorization` header and a marker string. With a capturing
@@ -1270,3 +1281,11 @@ Opus findings are O-M1 and O-L1 to O-L3; sol findings are S1 to S5, in the order
 | S3 | The `"summary"` default does not guarantee that no sensitive text reaches the Watch (sol, MEDIUM) | Addressed. D2 is decided: the default is `content = "state"` (fixed title, empty body, no event text fields). `"summary"`, `"label"` and `"detail"` are explicit opt-ins. The `"summary"` description now states only what the code guarantees (it never selects the raw `session_label`) and says the generated summary is unsanitized and may repeat prompt text. New invariant and a unit test that a marker in every event text field never appears in the default payload. |
 | S4 | Older response rows contradict the current design (8-hex tag; serde/serde_json as lockfile risks) (sol, LOW) | Addressed. Round-1 response 8 now states the 16-hex prefix and notes the change; round-2 response 1 names the corrected crate list. Rows that later rounds changed are also annotated: round-1 response 2 (default now `"state"`), round-2 response 4 (control epoch), round-3 response 2 (remove does not heal) and round-3 response 10 (D2 decided, Q3 docs-only). |
 | S5 | Q3 may add `allowed_labels` outside the otherwise final config schema (sol, LOW) | Addressed. Decided: Q3 changes README enrollment wording only. There is no `allowed_labels` key in this implementation, because a label is client-supplied and is neither an identity nor a security boundary. An enforced per-device rule would need a real device identity and a separate design. Option A's row and the Q3 text no longer mention the key, and the config schema is final. |
+
+## Review responses (round 5)
+
+| # | Finding (source) | Response |
+|---|---|---|
+| M1 | `origin_ms` is set only in `to_new_event`, so Kiro adapter relay events (`kiro_to_new_event`) bypass the freshness bound (opus, MEDIUM, blocking) | Addressed. "Event origin time" now states that `relay::run` sets `new.origin_ms = ev.received_ms` after either converter, so the freshness check runs on every relay-sourced event. The unit test and the stale-relay integration test cover both body shapes. |
+| L1 | Reusing `check_origin` logs `rejected cross-origin websocket` for `/webpush/*` (opus, LOW) | Addressed. `require_same_origin_json` logs its own warn `rejected cross-origin webpush request` on an Origin mismatch. |
+| L2 | Local-testing callers must send `Origin` on subscribe and unsubscribe (opus, LOW) | Addressed. One sentence under the Origin check: the check is unconditional, so loopback callers send `Origin` and a matching `Host`; integration tests set both. |
