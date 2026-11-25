@@ -13,9 +13,11 @@ pub const ICON_192: &[u8] = include_bytes!("../assets/icon-192.png");
 pub const ICON_512: &[u8] = include_bytes!("../assets/icon-512.png");
 /// Official Kiro logo, from https://kiro.dev/icon.svg.
 pub const KIRO_SVG: &[u8] = include_bytes!("../assets/icons/kiro.svg");
+/// auth-proxy sender mark (a shield with a keyhole), drawn for this repo.
+pub const AUTH_PROXY_SVG: &[u8] = include_bytes!("../assets/icons/auth-proxy.svg");
 
 /// Built-in sender icons, used when no user override exists.
-const BUILTIN_ICONS: &[(&str, &[u8])] = &[("kiro", KIRO_SVG)];
+const BUILTIN_ICONS: &[(&str, &[u8])] = &[("kiro", KIRO_SVG), ("auth-proxy", AUTH_PROXY_SVG)];
 
 pub const SVG: &str = "image/svg+xml";
 pub const PNG: &str = "image/png";
@@ -77,13 +79,23 @@ font-size=\"58\" font-weight=\"700\" fill=\"#fff\">{letter}</text></svg>"
 /// Placeholder in `index.html` replaced with [`ui_version`] when served.
 pub const VERSION_PLACEHOLDER: &str = "__NEARPUSH_VERSION__";
 
+/// The embedded assets hashed into [`ui_version`]. The sender icons come
+/// from [`BUILTIN_ICONS`] itself, so adding an icon there covers it here
+/// too — a hand-kept list is how an asset gets forgotten.
+fn ui_version_parts() -> Vec<&'static [u8]> {
+    let mut parts: Vec<&'static [u8]> =
+        vec![INDEX_HTML.as_bytes(), MANIFEST.as_bytes(), ICON_180, ICON_192, ICON_512];
+    parts.extend(BUILTIN_ICONS.iter().map(|(_, bytes)| *bytes));
+    parts
+}
+
 /// Crate version plus a hash of every embedded asset. The page reloads itself
 /// when the hello frame carries a different value.
 pub fn ui_version() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
         let mut h = Sha256::new();
-        for part in [INDEX_HTML.as_bytes(), MANIFEST.as_bytes(), ICON_180, ICON_192, ICON_512, KIRO_SVG] {
+        for part in ui_version_parts() {
             h.update((part.len() as u64).to_le_bytes());
             h.update(part);
         }
@@ -107,6 +119,7 @@ mod tests {
         let d = Some(dir.path());
         // Built-in, then generic.
         assert_eq!(resolve_icon(d, "kiro").unwrap().source, IconSource::Builtin);
+        assert_eq!(resolve_icon(d, "auth-proxy").unwrap().source, IconSource::Builtin);
         let g = resolve_icon(d, "cli").unwrap();
         assert_eq!((g.source, g.content_type), (IconSource::Generic, SVG));
         assert!(std::str::from_utf8(&g.bytes).unwrap().contains(">C</text>"));
@@ -119,6 +132,20 @@ mod tests {
         assert_eq!((i.source, i.content_type), (IconSource::Override, SVG));
         // No override dir configured.
         assert_eq!(resolve_icon(None, "kiro").unwrap().source, IconSource::Builtin);
+    }
+
+    #[test]
+    fn ui_version_covers_every_embedded_asset() {
+        // An asset missing from the hash lets a viewer keep a stale cached
+        // copy after an update (icons are served with max-age=3600).
+        let parts = ui_version_parts();
+        for asset in [INDEX_HTML.as_bytes(), MANIFEST.as_bytes(), ICON_180, ICON_192, ICON_512] {
+            assert!(parts.contains(&asset), "standalone asset missing from the ui_version hash");
+        }
+        for (name, bytes) in BUILTIN_ICONS {
+            assert!(parts.contains(bytes), "built-in icon {name} missing from the ui_version hash");
+        }
+        assert_eq!(parts.len(), 5 + BUILTIN_ICONS.len());
     }
 
     #[test]

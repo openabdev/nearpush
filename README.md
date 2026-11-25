@@ -521,7 +521,8 @@ otherwise (see above). Use `nearpush send --state allow` by hand or from another
   "missed":N}`. `{"type":"session_update","session":…,"label":…}` arrives when the
   summarizer labels a session. A browser `Origin` must match the `Host` header.
 - `GET /icons/<sender>`: the sender's icon. `~/.config/nearpush/icons/<sender>.svg`, then
-  `.png`, then a built-in icon (`kiro`: the official logo from <https://kiro.dev/icon.svg>),
+  `.png`, then a built-in icon (`kiro`: the official logo from <https://kiro.dev/icon.svg>;
+  `auth-proxy`: a shield mark drawn for this repo),
   then a generated tile with the sender's first letter. Only `[a-z0-9-]{1,32}` names
   resolve; anything else is 404.
 - `GET /`, `/manifest.webmanifest`, `/icon-*.png`, `/icons/*`: need an allowlisted
