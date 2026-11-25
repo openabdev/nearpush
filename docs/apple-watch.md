@@ -38,6 +38,24 @@ flowchart LR
    - `✅ all set`
    - `❓ allow?`
 
+## How the push is delivered
+
+1. `nearpushd` on the laptop receives events over HTTP at `127.0.0.1:8787`. It sends each
+   event with the Web Push protocol (RFC 8030) to the push service endpoint that Safari
+   returned at subscribe time. For iOS, that endpoint is on `web.push.apple.com`.
+2. The payload is encrypted with the subscription keys (RFC 8291, `aes128gcm`). Each request
+   is signed with a VAPID key (RFC 8292). The VAPID private key is stored in a file with
+   mode 0600.
+3. The iPhone subscribes from a Home Screen web app. The page is served through
+   `tailscale serve`, so it is reachable only on the tailnet, not through Funnel. The
+   subscription is stored on the laptop.
+4. Apple's push service forwards the notification to the paired iPhone. When the phone is
+   locked, the iPhone mirrors the notification to the Apple Watch.
+5. On 2026-11-25, Apple's push service returned HTTP 201 for each send in the spike.
+
+The spike used a separate tool, `tools/webpush-spike`. The production daemon was not
+changed.
+
 ## Open items
 
 - **Declarative Web Push.** Whether the Declarative Web Push format supports a per-push icon
