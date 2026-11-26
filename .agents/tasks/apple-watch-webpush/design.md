@@ -957,7 +957,7 @@ check on it would only look like enforcement. Every viewer allowlisted for the p
 already subscribe any device it controls; that is the trust boundary. If pahud later
 wants an enforced per-device restriction, it needs a real device identity and is a
 separate design change. The config schema in "Config keys" is therefore final for this
-implementation, and the implementation can proceed before Q3 is decided.
+implementation. Q3 is decided (option B), and the implementation proceeds with both devices receiving pushes.
 
 | Option | What changes in this design | Trade-off |
 |---|---|---|
