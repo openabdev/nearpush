@@ -300,15 +300,22 @@ pub struct PushCtx {
     pub summary: Option<String>,
     /// The control epoch read together with `paused` at commit.
     pub control_epoch: u64,
+    /// State of the session's previous stateful event in the store buffer, if any.
+    pub prior_state: Option<AgentState>,
 }
 
 /// Whether a stored event is pushed: not muted, has a state that `[webpush] states`
-/// and the display filter both list, and is at most `ttl_secs` old.
-pub fn should_push(ev: &Event, origin_ms: u64, now_ms: u64, filter: &[AgentState], cfg: &WebPushConfig) -> bool {
+/// and the display filter both list, and is at most `ttl_secs` old. An `all_set`
+/// whose session's previous stateful event (`prior`) was also `all_set` is not pushed
+/// again; the event itself is still stored and shown.
+pub fn should_push(ev: &Event, prior: Option<AgentState>, origin_ms: u64, now_ms: u64, filter: &[AgentState], cfg: &WebPushConfig) -> bool {
     if ev.muted {
         return false;
     }
     let Some(s) = ev.state else { return false };
+    if s == AgentState::AllSet && prior == Some(AgentState::AllSet) {
+        return false;
+    }
     s != AgentState::Working
         && cfg.states.contains(&s)
         && filter.contains(&s)
@@ -982,7 +989,7 @@ impl WebPush {
     /// Called by `server::commit()` for every stored event. Never blocks, never fails.
     pub fn notify(&self, ev: &Event, ctx: PushCtx) {
         let filter = self.control.read().unwrap_or_else(|p| p.into_inner()).states.clone();
-        if !should_push(ev, ctx.origin_ms, now_ms(), &filter, &self.cfg) {
+        if !should_push(ev, ctx.prior_state, ctx.origin_ms, now_ms(), &filter, &self.cfg) {
             return;
         }
         let Some(state) = ev.state else { return };
@@ -1400,20 +1407,35 @@ mod tests {
         let c = cfg();
         let now = 1_000_000;
         for s in [AgentState::YourTurn, AgentState::Allow, AgentState::AllSet] {
-            assert!(should_push(&ev(Some(s)), now, now, ALL, &c), "{s:?}");
+            assert!(should_push(&ev(Some(s)), None, now, now, ALL, &c), "{s:?}");
         }
-        assert!(!should_push(&ev(Some(AgentState::Working)), now, now, ALL, &c), "working");
-        assert!(!should_push(&ev(None), now, now, ALL, &c), "no state");
+        assert!(!should_push(&ev(Some(AgentState::Working)), None, now, now, ALL, &c), "working");
+        assert!(!should_push(&ev(None), None, now, now, ALL, &c), "no state");
         let mut muted = ev(Some(AgentState::AllSet));
         muted.muted = true;
-        assert!(!should_push(&muted, now, now, ALL, &c), "muted");
-        assert!(!should_push(&ev(Some(AgentState::AllSet)), now, now, &[AgentState::YourTurn], &c), "filter excludes");
+        assert!(!should_push(&muted, None, now, now, ALL, &c), "muted");
+        assert!(!should_push(&ev(Some(AgentState::AllSet)), None, now, now, &[AgentState::YourTurn], &c), "filter excludes");
         let only = WebPushConfig { states: vec![AgentState::YourTurn], ..cfg() };
-        assert!(!should_push(&ev(Some(AgentState::AllSet)), now, now, ALL, &only), "[webpush] states excludes");
+        assert!(!should_push(&ev(Some(AgentState::AllSet)), None, now, now, ALL, &only), "[webpush] states excludes");
         let e = ev(Some(AgentState::YourTurn));
-        assert!(should_push(&e, now - 300_000, now, ALL, &c), "age = ttl pushes");
-        assert!(!should_push(&e, now - 301_000, now, ALL, &c), "age = ttl + 1 s does not");
-        assert!(should_push(&e, now + 60_000, now, ALL, &c), "origin in the future is age 0");
+        assert!(should_push(&e, None, now - 300_000, now, ALL, &c), "age = ttl pushes");
+        assert!(!should_push(&e, None, now - 301_000, now, ALL, &c), "age = ttl + 1 s does not");
+        assert!(should_push(&e, None, now + 60_000, now, ALL, &c), "origin in the future is age 0");
+    }
+
+    #[test]
+    fn repeated_all_set_is_not_pushed() {
+        use AgentState::*;
+        let c = cfg();
+        let now = 1_000_000;
+        let push = |s, prior| should_push(&ev(Some(s)), prior, now, now, ALL, &c);
+        assert!(!push(AllSet, Some(AllSet)), "consecutive all_set suppressed");
+        assert!(push(AllSet, Some(YourTurn)), "your_turn in between allows the next all_set");
+        assert!(push(AllSet, Some(Working)), "working counts as a turn boundary");
+        assert!(push(AllSet, Some(Allow)), "allow in between allows the next all_set");
+        assert!(push(AllSet, None), "no prior event pushes");
+        assert!(push(YourTurn, Some(YourTurn)) && push(YourTurn, Some(AllSet)), "your_turn unaffected");
+        assert!(push(Allow, Some(Allow)) && push(Allow, Some(AllSet)), "allow unaffected");
     }
 
     fn json(bytes: &[u8]) -> serde_json::Value {

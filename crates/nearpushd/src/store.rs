@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
-use crate::event::{Event, NewEvent};
+use crate::event::{AgentState, Event, NewEvent};
 
 pub const EVENTS_FILE: &str = "events.jsonl";
 
@@ -132,7 +132,17 @@ impl Store {
 
     /// Assigns an id, persists the event, then publishes it.
     pub fn push(&self, new: NewEvent) -> io::Result<Arc<Event>> {
+        self.push_with_prior(new).map(|(ev, _)| ev)
+    }
+
+    /// Like `push`, and also returns the state of the newest buffered event of the same
+    /// session that has a state, looked up under the same lock before this event is
+    /// added. `None` when the event has no session or the buffer holds no such event.
+    pub fn push_with_prior(&self, new: NewEvent) -> io::Result<(Arc<Event>, Option<AgentState>)> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = new.session.as_deref().and_then(|s| {
+            inner.buf.iter().rev().filter(|e| e.session.as_deref() == Some(s)).find_map(|e| e.state)
+        });
         let ev = new.into_event(inner.next_id, now_ms());
         let mut line = serde_json::to_vec(&ev).map_err(io::Error::other)?;
         line.push(b'\n');
@@ -158,7 +168,7 @@ impl Store {
         // Published under the lock so a concurrent subscribe() sees each event
         // either in its snapshot or on its receiver, never both and never neither.
         let _ = self.tx.send(ev.clone());
-        Ok(ev)
+        Ok((ev, prior))
     }
 
     /// Buffered events with id greater than `since`, oldest first.
@@ -281,6 +291,33 @@ mod tests {
 
     fn ev(title: &str) -> NewEvent {
         NewEvent { title: title.into(), ..Default::default() }
+    }
+
+    fn sev(session: &str, state: Option<AgentState>) -> NewEvent {
+        NewEvent { title: "t".into(), session: Some(session.into()), state, ..Default::default() }
+    }
+
+    #[test]
+    fn push_with_prior_reports_the_sessions_last_stateful_event() {
+        use AgentState::*;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), 10, 16).unwrap();
+        let prior = |n| s.push_with_prior(n).unwrap().1;
+        assert_eq!(prior(sev("a", Some(AllSet))), None, "no prior event in the buffer");
+        assert_eq!(prior(sev("a", Some(AllSet))), Some(AllSet), "consecutive all_set");
+        assert_eq!(prior(sev("b", Some(YourTurn))), None, "other session does not count");
+        assert_eq!(prior(sev("a", None)), Some(AllSet));
+        assert_eq!(prior(sev("a", Some(AllSet))), Some(AllSet), "stateless event in between is skipped");
+        assert_eq!(prior(sev("a", Some(YourTurn))), Some(AllSet));
+        assert_eq!(prior(sev("a", Some(AllSet))), Some(YourTurn), "your_turn in between");
+        assert_eq!(prior(sev("b", Some(AllSet))), Some(YourTurn), "b sees only its own events");
+        assert_eq!(prior(ev("no session")), None, "an event without a session has no prior");
+        let states: Vec<_> = s.since(0).iter().filter(|e| e.session.as_deref() == Some("a")).map(|e| e.state).collect();
+        assert_eq!(
+            states,
+            vec![Some(AllSet), Some(AllSet), None, Some(AllSet), Some(YourTurn), Some(AllSet)],
+            "every event is still stored"
+        );
     }
 
     #[test]
