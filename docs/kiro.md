@@ -102,6 +102,8 @@ sequenceDiagram
    this session, changed in the last 24 h). It never changes the verdict; nearpushd shows
    it only as a footer `N wf waiting` when the final verdict is `all set.`. Running counts
    are not shown.
+
+   Back-to-back `all_set` events for the same session do not send another Web Push; see [Notifications and Apple Watch (Web Push)](../README.md#notifications-and-apple-watch-web-push) in the README.
 4. **Reconnect**: the iPhone reconnects with `since=<last id>` and nearpushd replays what it
    missed; a small note appears if events fell out of the buffer.
 
