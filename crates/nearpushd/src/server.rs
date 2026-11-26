@@ -642,13 +642,13 @@ async fn commit(state: &AppState, mut new: NewEvent, prompt: Option<String>) -> 
     }
     let store = state.store.clone();
     let sessions = state.sessions.clone();
-    let (ev, summarize) = tokio::task::spawn_blocking(move || {
-        let ev = store.push(new)?;
+    let (ev, prior_state, summarize) = tokio::task::spawn_blocking(move || {
+        let (ev, prior_state) = store.push_with_prior(new)?;
         let summarize = match (session.as_deref(), prompt.as_deref()) {
             (Some(s), Some(p)) => sessions.record_prompt(s, p, ev.ts),
             _ => false,
         };
-        Ok::<_, std::io::Error>((ev, summarize))
+        Ok::<_, std::io::Error>((ev, prior_state, summarize))
     })
     .await
     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -660,7 +660,7 @@ async fn commit(state: &AppState, mut new: NewEvent, prompt: Option<String>) -> 
     // The one push hook: every stored stateful event passes here (direct /push, relay,
     // classifier-deferred Stops). `notify` only does a try_send.
     if let Some(wp) = &state.webpush {
-        wp.notify(&ev, PushCtx { origin_ms: origin_ms.unwrap_or(ev.ts), summary, control_epoch });
+        wp.notify(&ev, PushCtx { origin_ms: origin_ms.unwrap_or(ev.ts), summary, control_epoch, prior_state });
     }
     if summarize {
         if let (Some(sum), Some(s)) = (&state.summarizer, ev.session.as_deref()) {

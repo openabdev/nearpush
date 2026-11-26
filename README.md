@@ -595,6 +595,8 @@ itself, so installing a new `nearpushd` updates the phone with no action on it.
 With `[webpush] enabled = true` (and a `subject`), nearpushd sends `your_turn`, `allow`
 and `all_set` as Web Push notifications to the home-screen app. iOS mirrors them to a
 paired Apple Watch while the iPhone is locked. `working` and generic events never push.
+An `all_set` is not pushed when the same session's previous event in the buffer was
+already `all_set`; it is still stored and shown on the page.
 
 1. Set `[webpush]` in config.toml and restart nearpushd. It creates
    `~/.config/nearpush/webpush-vapid.pem` on first start.

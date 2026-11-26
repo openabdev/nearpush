@@ -84,7 +84,9 @@ sequenceDiagram
 
 ### Send
 
-Only `your_turn`, `allow` and `all_set` can push. `working` is never pushed.
+Only `your_turn`, `allow` and `all_set` can push. `working` is never pushed. An
+`all_set` is skipped when the same session's previous event in the buffer (ignoring
+stateless records such as `dismissed`) was also `all_set`; the page still shows it.
 
 ```mermaid
 sequenceDiagram
