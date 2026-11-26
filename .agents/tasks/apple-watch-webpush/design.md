@@ -6,9 +6,9 @@ Evidence: [spike-report.md](spike-report.md) (Q1 PASS, Q2 PASS, both observed on
 pahud's carried iPhone, iOS 18.7, with a paired Apple Watch). Nothing here is
 implemented or merged.
 
-One decision is left to pahud: which devices receive pushes (Q3, see "Open
-decisions"). Q3 affects README wording only; it adds no config key and no code (see
-Q3). The default payload text (D2) is decided in this revision: `content = "state"`,
+Q3 is decided: both devices receive pushes, with no cross-device dedupe (see
+Q3). Q3 affects README wording only; it adds no config key and no code. The default
+payload text (D2) is decided in this revision: `content = "state"`,
 which keeps all task text off the lock screen and the Watch; richer content is an
 explicit opt-in. One verification item is open: whether Declarative Web Push supports a
 per-push icon or a custom summary (O1).
