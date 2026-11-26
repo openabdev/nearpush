@@ -71,6 +71,104 @@ pub struct Config {
     pub public_url: Option<String>,
     /// Event relay puller (see `crates/eventrelay`).
     pub relay: RelayConfig,
+    /// Web Push to the home-screen web app (and from there to a paired Apple Watch).
+    pub webpush: WebPushConfig,
+}
+
+/// States a push can be sent for. `working` is never pushed.
+pub const WEBPUSH_STATES: &[AgentState] = &[AgentState::YourTurn, AgentState::Allow, AgentState::AllSet];
+pub const DEFAULT_WEBPUSH_TTL_SECS: u64 = 300;
+pub const DEFAULT_ENDPOINT_HOST: &str = "web.push.apple.com";
+
+/// What the notification body carries; see the README's privacy notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PushContent {
+    /// Title only, empty body: no task text leaves the daemon.
+    #[default]
+    State,
+    /// The summarized label (or the session tag), then the project.
+    Summary,
+    /// As `summary`, but the stored session label, which may be the raw first prompt line.
+    Label,
+    /// As `label`, then the detail line (commands, file paths).
+    Detail,
+}
+
+/// `[webpush]`: optional Web Push sender. Off by default.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebPushConfig {
+    /// Create the VAPID key and send pushes.
+    pub enabled: bool,
+    /// VAPID contact sent to the push service (`mailto:` or `https://`). Required when enabled.
+    pub subject: Option<String>,
+    /// Which states push; a subset of your_turn, allow and all_set.
+    pub states: Vec<AgentState>,
+    pub content: PushContent,
+    /// Push TTL, and the freshness bound for pushing an event (30..=3600).
+    pub ttl_secs: u64,
+    /// Push service hosts the daemon may post to.
+    pub endpoint_hosts: Vec<String>,
+}
+
+impl Default for WebPushConfig {
+    fn default() -> Self {
+        WebPushConfig {
+            enabled: false,
+            subject: None,
+            states: WEBPUSH_STATES.to_vec(),
+            content: PushContent::State,
+            ttl_secs: DEFAULT_WEBPUSH_TTL_SECS,
+            endpoint_hosts: vec![DEFAULT_ENDPOINT_HOST.to_string()],
+        }
+    }
+}
+
+/// A bare lowercase hostname: letters, digits, `-` and `.`, no scheme, port or path.
+fn bare_hostname(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 253
+        && !h.starts_with('.')
+        && !h.ends_with('.')
+        && !h.contains("..")
+        && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+}
+
+impl WebPushConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        let bad = |m: String| Err(io::Error::new(io::ErrorKind::InvalidInput, m));
+        if self.enabled {
+            match &self.subject {
+                None => return bad("webpush.subject is required when webpush.enabled is true".into()),
+                Some(s) => {
+                    if !(s.starts_with("mailto:") || s.starts_with("https://")) || s.len() > 256 {
+                        return bad("webpush.subject must start with mailto: or https:// and be at most 256 bytes".into());
+                    }
+                }
+            }
+            if self.endpoint_hosts.is_empty() {
+                return bad("webpush.endpoint_hosts must not be empty when webpush.enabled is true".into());
+            }
+        }
+        for (i, s) in self.states.iter().enumerate() {
+            if !WEBPUSH_STATES.contains(s) {
+                return bad("webpush.states may only list your_turn, allow and all_set (working is never pushed)".into());
+            }
+            if self.states[..i].contains(s) {
+                return bad("webpush.states lists a state twice".into());
+            }
+        }
+        if !(30..=3600).contains(&self.ttl_secs) {
+            return bad("webpush.ttl_secs must be 30..=3600".into());
+        }
+        for h in &self.endpoint_hosts {
+            if !bare_hostname(h) {
+                return bad(format!("webpush.endpoint_hosts: {h:?} is not a bare lowercase hostname"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Default display filter: `working` is off.
@@ -197,6 +295,7 @@ impl Default for Config {
             hook: HookConfig::default(),
             public_url: None,
             relay: RelayConfig::default(),
+            webpush: WebPushConfig::default(),
         }
     }
 }
@@ -258,6 +357,7 @@ impl Config {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "relay.consumer_token_keychain_service is empty"));
             }
         }
+        self.webpush.validate()?;
         Ok(())
     }
 }
@@ -474,6 +574,58 @@ mod tests {
         assert!(toml::from_str::<Config>("[relay]\ntoken = \"x\"").is_err(), "no token key in config");
         let cfg: Config = toml::from_str("[relay]\nstate_file = \"/tmp/c.json\"").unwrap();
         assert_eq!(cfg.relay.cursor_path(Path::new("/s")), PathBuf::from("/tmp/c.json"));
+    }
+
+    #[test]
+    fn webpush_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let w = &cfg.webpush;
+        assert!(!w.enabled);
+        assert_eq!(w.subject, None);
+        assert_eq!(w.states, vec![AgentState::YourTurn, AgentState::Allow, AgentState::AllSet]);
+        assert_eq!(w.content, PushContent::State);
+        assert_eq!(WebPushConfig::default().content, PushContent::State);
+        assert_eq!(w.ttl_secs, 300);
+        assert_eq!(w.endpoint_hosts, vec!["web.push.apple.com".to_string()]);
+        assert!(cfg.validate().is_ok(), "disabled needs no subject");
+
+        let ok = "[webpush]\nenabled = true\nsubject = \"mailto:you@example.com\"";
+        assert!(toml::from_str::<Config>(ok).unwrap().validate().is_ok());
+        let https = "[webpush]\nenabled = true\nsubject = \"https://example.com/contact\"";
+        assert!(toml::from_str::<Config>(https).unwrap().validate().is_ok());
+        let invalid = |extra: &str| {
+            let text = format!("{ok}\n{extra}");
+            toml::from_str::<Config>(&text).map(|c| c.validate().is_err()).unwrap_or(true)
+        };
+        // subject
+        assert!(toml::from_str::<Config>("[webpush]\nenabled = true").unwrap().validate().is_err(), "subject required");
+        assert!(toml::from_str::<Config>("[webpush]\nenabled = true\nsubject = \"you@example.com\"").unwrap().validate().is_err());
+        let long = format!("[webpush]\nenabled = true\nsubject = \"mailto:{}\"", "a".repeat(250));
+        assert!(toml::from_str::<Config>(&long).unwrap().validate().is_err(), "subject over 256 bytes");
+        // states
+        assert!(invalid("states = [\"working\"]"), "working is rejected");
+        assert!(invalid("states = [\"all_set\", \"all_set\"]"), "no repeats");
+        assert!(!invalid("states = []"), "empty is allowed");
+        assert!(!invalid("states = [\"allow\"]"));
+        // content
+        for c in ["state", "summary", "label", "detail"] {
+            assert!(!invalid(&format!("content = \"{c}\"")), "{c}");
+        }
+        assert!(invalid("content = \"everything\""));
+        // ttl
+        for t in ["29", "3601", "0"] {
+            assert!(invalid(&format!("ttl_secs = {t}")), "ttl {t}");
+        }
+        assert!(!invalid("ttl_secs = 30") && !invalid("ttl_secs = 3600"));
+        // endpoint_hosts
+        assert!(invalid("endpoint_hosts = []"), "empty when enabled");
+        for h in ["https://web.push.apple.com", "web.push.apple.com:443", "web.push.apple.com/x", "Web.Push.Apple.com", ""] {
+            assert!(invalid(&format!("endpoint_hosts = [\"{h}\"]")), "{h}");
+        }
+        assert!(!invalid("endpoint_hosts = [\"web.push.apple.com\", \"push.example.org\"]"));
+        // unknown keys
+        assert!(toml::from_str::<Config>("[webpush]\nbogus = 1").is_err());
+        assert!(toml::from_str::<Config>("[webpush]\nallowed_labels = []").is_err());
     }
 
     #[test]

@@ -147,6 +147,11 @@ pub struct NewEvent {
     /// Id of the relay event this came from; set by the relay puller, never by clients.
     #[serde(skip)]
     pub relay_id: Option<u64>,
+    /// When the event first reached the relay (its `received_ms`), set by the relay
+    /// puller only. Used for the Web Push freshness bound; never stored, clients cannot
+    /// send it.
+    #[serde(skip)]
+    pub origin_ms: Option<u64>,
     /// A history record of a dismissed card, written by the daemon only; clients cannot send it.
     #[serde(skip)]
     pub dismissed: bool,
@@ -359,6 +364,7 @@ impl NewEvent {
             question_line: None,
             jev_noul: None,
             relay_id: self.relay_id,
+            origin_ms: self.origin_ms,
             dismissed: self.dismissed,
         })
     }
