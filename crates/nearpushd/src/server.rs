@@ -39,9 +39,12 @@ use crate::relay::{RelayHealth, RelayView};
 use crate::sessions::{SessionUpdate, Sessions};
 use crate::store::{Store, now_ms};
 use crate::summarizer::{Summarizer, SummarizerHealth};
+use crate::webpush::{self, PushCtx, RemoveOutcome, Selector, WebPush, WebPushView};
 
 /// Largest accepted `POST /push` body.
 pub const MAX_PUSH_BYTES: usize = 16 * 1024;
+/// Largest accepted `/webpush/subscribe` and `/webpush/unsubscribe` body.
+pub const MAX_WEBPUSH_BYTES: usize = 4 * 1024;
 pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Events listed in `GET /status`.
 pub const STATUS_RECENT: usize = 5;
@@ -76,6 +79,9 @@ pub struct ControlState {
     pub classifier_source: ProviderSource,
     /// Where control.json is written; `None` keeps changes in memory only.
     pub state_dir: Option<PathBuf>,
+    /// Bumped by `POST /control` whenever `paused` or the effective `states` set
+    /// changes. In memory only; a queued web push whose epoch differs is dropped.
+    pub epoch: u64,
 }
 
 impl ControlState {
@@ -142,6 +148,8 @@ pub struct AppState {
     pub summarizer_health: Arc<SummarizerHealth>,
     /// Relay puller state for `/status`.
     pub relay: Arc<RelayHealth>,
+    /// `None` when `[webpush]` is disabled.
+    pub webpush: Option<Arc<WebPush>>,
     /// Serializes `POST /control` updates.
     control_write: Arc<tokio::sync::Mutex<()>>,
     /// The latest held Stop of each session. A later held Stop of the same session waits
@@ -175,12 +183,14 @@ impl AppState {
                 classifier: Provider::default(),
                 classifier_source: ProviderSource::Config,
                 state_dir: None,
+                epoch: 0,
             })),
             viewers: Arc::new(AtomicUsize::new(0)),
             started_at_ms: now_ms(),
             public_url: Arc::new(RwLock::new(None)),
             summarizer_health: Arc::new(SummarizerHealth::default()),
             relay: Arc::new(RelayHealth::default()),
+            webpush: None,
             control_write: Arc::new(tokio::sync::Mutex::new(())),
             stop_chain: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -281,6 +291,11 @@ impl AppState {
         self
     }
 
+    pub fn with_webpush(mut self, webpush: Arc<WebPush>) -> Self {
+        self.webpush = Some(webpush);
+        self
+    }
+
     pub fn with_public_url(self, url: Option<String>) -> Self {
         *self.public_url.write().unwrap_or_else(|p| p.into_inner()) = url;
         self
@@ -299,6 +314,12 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/dismiss", post(dismiss))
         .route("/v1/undismiss", post(undismiss))
         .route("/ws", get(ws))
+        .route("/sw.js", get(service_worker))
+        .route("/webpush/key", get(webpush_key))
+        .route("/webpush/subscribe", post(webpush_subscribe).layer(DefaultBodyLimit::max(MAX_WEBPUSH_BYTES)))
+        .route("/webpush/unsubscribe", post(webpush_unsubscribe).layer(DefaultBodyLimit::max(MAX_WEBPUSH_BYTES)))
+        .route("/webpush/test", post(webpush_test))
+        .route("/webpush/remove", post(webpush_remove))
         .route("/", get(index))
         .route("/manifest.webmanifest", get(manifest))
         .route("/icon-180.png", icon(assets::ICON_180))
@@ -394,7 +415,19 @@ pub fn authorize_viewer(state: &AppState, peer: SocketAddr, headers: &HeaderMap)
 /// Rejects cross-site WebSocket opens: a browser `Origin` must name the same host
 /// the request was sent to. Clients that send no `Origin` (websocat, tests) pass.
 pub fn check_origin(headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(origin) = headers.get(header::ORIGIN) else { return Ok(()) };
+    if !headers.contains_key(header::ORIGIN) || origin_matches(headers) {
+        Ok(())
+    } else {
+        let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or("");
+        tracing::warn!(origin, "rejected cross-origin websocket");
+        Err(ApiError::new(StatusCode::FORBIDDEN, "cross-origin websocket"))
+    }
+}
+
+/// Whether the `Origin` header names the host the request was sent to (`Host` or
+/// `X-Forwarded-Host`). False when it is missing.
+fn origin_matches(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else { return false };
     let origin = origin.to_str().unwrap_or("");
     let origin_host = origin
         .strip_prefix("https://")
@@ -406,12 +439,28 @@ pub fn check_origin(headers: &HeaderMap) -> Result<(), ApiError> {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|h| !origin_host.is_empty() && h.eq_ignore_ascii_case(origin_host))
     };
-    if matches(header::HOST) || matches(header::HeaderName::from_static("x-forwarded-host")) {
-        Ok(())
-    } else {
-        tracing::warn!(origin, "rejected cross-origin websocket");
-        Err(ApiError::new(StatusCode::FORBIDDEN, "cross-origin websocket"))
+    matches(header::HOST) || matches(header::HeaderName::from_static("x-forwarded-host"))
+}
+
+/// The CSRF check of the state-changing `/webpush/*` page routes, in this order: a
+/// present `Origin` (403), the same origin (403), a JSON content type (415). Unlike
+/// [`check_origin`], a missing `Origin` fails.
+pub fn require_same_origin_json(headers: &HeaderMap, path: &'static str) -> Result<(), ApiError> {
+    if !headers.contains_key(header::ORIGIN) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "missing Origin"));
     }
+    if !origin_matches(headers) {
+        tracing::warn!(path, "rejected cross-origin webpush request");
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "cross-origin request"));
+    }
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().to_ascii_lowercase().starts_with("application/json"));
+    if !json {
+        return Err(ApiError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "send application/json"));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -573,15 +622,23 @@ async fn note_prompt(state: &AppState, session: &str, prompt: Option<String>, ts
 /// Stores and publishes an event: muted when paused, with the session label
 /// replaced by its summarized one, and queues the summarizer when the prompt asks.
 async fn commit(state: &AppState, mut new: NewEvent, prompt: Option<String>) -> Result<Arc<Event>, ApiError> {
-    // Paused (DND): stored and marked muted, never broadcast or replayed.
-    new.muted = state.control.read().unwrap_or_else(|p| p.into_inner()).paused;
+    // Paused (DND): stored and marked muted, never broadcast or replayed. The control
+    // epoch is read in the same read, so a later pause or filter change cancels the push.
+    let control_epoch = {
+        let c = state.control.read().unwrap_or_else(|p| p.into_inner());
+        new.muted = c.paused;
+        c.epoch
+    };
+    // When the event first reached nearpush; only relay events carry one.
+    let origin_ms = new.origin_ms;
     // The prompt only feeds the summarizer; it is never stored with the event, and
     // it is not recorded at all when the summarizer is off.
     let prompt = prompt.filter(|_| state.summarizer.is_some());
     let session = new.session.clone();
-    if let Some(label) = session.as_deref().and_then(|s| state.sessions.label(s)) {
+    let summary = session.as_deref().and_then(|s| state.sessions.label(s));
+    if let Some(label) = &summary {
         // A summarized label replaces the hook's provisional one.
-        new.session_label = Some(label);
+        new.session_label = Some(label.clone());
     }
     let store = state.store.clone();
     let sessions = state.sessions.clone();
@@ -600,6 +657,11 @@ async fn commit(state: &AppState, mut new: NewEvent, prompt: Option<String>) -> 
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to persist event: {e}"))
     })?;
     track_main(state, &ev).await;
+    // The one push hook: every stored stateful event passes here (direct /push, relay,
+    // classifier-deferred Stops). `notify` only does a try_send.
+    if let Some(wp) = &state.webpush {
+        wp.notify(&ev, PushCtx { origin_ms: origin_ms.unwrap_or(ev.ts), summary, control_epoch });
+    }
     if summarize {
         if let (Some(sum), Some(s)) = (&state.summarizer, ev.session.as_deref()) {
             sum.request(s);
@@ -791,6 +853,7 @@ struct StatusView<'a> {
     pending_your_turn: Vec<PendingView>,
     relay: RelayView,
     public_url: Option<String>,
+    webpush: WebPushView,
     recent: Vec<RecentView<'a>>,
 }
 
@@ -849,6 +912,7 @@ async fn status(
         pending_your_turn,
         relay: state.relay.view(),
         public_url: state.public_url.read().unwrap_or_else(|p| p.into_inner()).clone(),
+        webpush: state.webpush.as_ref().map_or_else(WebPushView::disabled, |w| w.view()),
         recent: recent
             .iter()
             .map(|e| RecentView {
@@ -925,6 +989,13 @@ async fn control(
         next.classifier = p;
         next.classifier_source = ProviderSource::Control;
         tracing::info!(provider = p.as_str(), "classifier changed");
+    }
+    // Any pause or filter change cancels web pushes already queued. The filter is
+    // compared as a set; a classifier-only change does not count.
+    let before = state.controls();
+    let same_states = before.states.iter().all(|s| next.states.contains(s)) && next.states.iter().all(|s| before.states.contains(s));
+    if before.paused != next.paused || !same_states {
+        next.epoch = next.epoch.wrapping_add(1);
     }
     if let Some(dir) = next.state_dir.clone() {
         let persisted = next.persisted(&state.main.lock().unwrap_or_else(|p| p.into_inner()));
@@ -1154,7 +1225,7 @@ fn page_headers(content_type: &'static str, cache: &'static str) -> [(header::He
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(
                 "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-                 connect-src 'self' wss: ws:; img-src 'self'; manifest-src 'self'; \
+                 connect-src 'self' wss: ws:; img-src 'self'; manifest-src 'self'; worker-src 'self'; \
                  base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
             ),
         ),
@@ -1200,6 +1271,173 @@ async fn sender_icon(
     let icon = assets::resolve_icon(state.icons_dir.as_deref(), sender)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown sender"))?;
     Ok((page_headers(icon.content_type, "public, max-age=3600"), icon.bytes.into_owned()).into_response())
+}
+
+// ---- web push -------------------------------------------------------------------
+
+fn webpush_enabled(state: &AppState) -> Result<Arc<WebPush>, ApiError> {
+    state.webpush.clone().ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "web push is disabled"))
+}
+
+/// 500 for a change that is live in memory but not saved yet.
+fn not_saved() -> Response {
+    let body = serde_json::json!({ "error": "cannot save webpush.json", "applied": true });
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+}
+
+/// `GET /sw.js`: the service worker, served also when web push is disabled so a page
+/// that registered it keeps a current copy.
+async fn service_worker(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_viewer(&state, peer, &headers)?;
+    Ok((page_headers("text/javascript", "no-cache"), assets::SW_JS).into_response())
+}
+
+/// `GET /webpush/key`: the VAPID public key for `pushManager.subscribe`.
+async fn webpush_key(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_viewer(&state, peer, &headers)?;
+    let body = match &state.webpush {
+        Some(w) => serde_json::json!({ "enabled": true, "key": w.public_key_b64(), "key_id": w.key_id() }),
+        None => serde_json::json!({ "enabled": false, "key": null, "key_id": null }),
+    };
+    Ok(Json(body).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscribeRequest {
+    subscription: SubscriptionBody,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// A browser `PushSubscription.toJSON()`; unknown inner fields are ignored.
+#[derive(Deserialize)]
+struct SubscriptionBody {
+    endpoint: String,
+    /// Accepted (null or a number) and stored nowhere.
+    #[serde(default, rename = "expirationTime")]
+    _expiration_time: Option<f64>,
+    keys: SubscriptionKeys,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionKeys {
+    p256dh: String,
+    auth: String,
+}
+
+/// `POST /webpush/subscribe`: upserts this device's subscription. Error responses
+/// never echo the submitted endpoint.
+async fn webpush_subscribe(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    authorize_viewer(&state, peer, &headers)?;
+    require_same_origin_json(&headers, "/webpush/subscribe")?;
+    let wp = webpush_enabled(&state)?;
+    let bad = |m: &'static str| {
+        tracing::debug!(error = m, "rejected webpush subscription");
+        ApiError::new(StatusCode::BAD_REQUEST, m)
+    };
+    let req: SubscribeRequest = serde_json::from_slice(&body).map_err(|_| bad("invalid subscription"))?;
+    let k = &req.subscription.keys;
+    let mut sub =
+        webpush::validate_subscription(wp.endpoint_policy(), &req.subscription.endpoint, &k.p256dh, &k.auth, req.label.as_deref())
+            .map_err(bad)?;
+    sub.login = headers
+        .get(LOGIN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(|| "loopback".to_string(), |l| l.trim().to_string());
+    match wp.add_sub(sub).await {
+        Err(webpush::AddError::TooMany) => Err(ApiError::new(StatusCode::CONFLICT, "too many subscriptions")),
+        Err(webpush::AddError::Internal) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot create a subscription id")),
+        Ok((_, Err(_))) => Ok(not_saved()),
+        Ok((res, Ok(()))) => {
+            tracing::info!(id = %res.id, created = res.created, "webpush subscription saved");
+            Ok(Json(serde_json::json!({ "id": res.id, "created": res.created })).into_response())
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnsubscribeRequest {
+    endpoint: String,
+}
+
+/// `POST /webpush/unsubscribe`: removes this device's subscription. An unknown
+/// endpoint answers `removed: false`, so the page cannot probe.
+async fn webpush_unsubscribe(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    authorize_viewer(&state, peer, &headers)?;
+    require_same_origin_json(&headers, "/webpush/unsubscribe")?;
+    let wp = webpush_enabled(&state)?;
+    let req: UnsubscribeRequest = serde_json::from_slice(&body)
+        .ok()
+        .filter(|r: &UnsubscribeRequest| r.endpoint.len() <= 1024)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "send {\"endpoint\": string}"))?;
+    match wp.remove_sub(Selector::Endpoint(req.endpoint), None).await {
+        RemoveOutcome::Removed { persisted: Ok(()) } => Ok(Json(serde_json::json!({ "removed": true })).into_response()),
+        RemoveOutcome::Removed { persisted: Err(_) } => Ok(not_saved()),
+        RemoveOutcome::Absent | RemoveOutcome::RevMismatch => {
+            tracing::debug!("webpush unsubscribe for an unknown endpoint");
+            Ok(Json(serde_json::json!({ "removed": false })).into_response())
+        }
+    }
+}
+
+/// `POST /webpush/test`: loopback + token. One test push per subscription, ignoring
+/// pause, filter and freshness.
+async fn webpush_test(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_local(peer, &headers, &state.token)?;
+    let wp = webpush_enabled(&state)?;
+    let results = wp.test_all().await;
+    Ok(Json(serde_json::json!({ "results": results })).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveRequest {
+    id: String,
+}
+
+/// `POST /webpush/remove`: loopback + token. Removes a subscription by id.
+async fn webpush_remove(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    authorize_local(peer, &headers, &state.token)?;
+    let wp = webpush_enabled(&state)?;
+    let valid = |id: &str| id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let req: RemoveRequest = serde_json::from_slice(&body)
+        .ok()
+        .filter(|r: &RemoveRequest| valid(&r.id))
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "send {\"id\": 16 lowercase hex}"))?;
+    match wp.remove_sub(Selector::Id(req.id), None).await {
+        RemoveOutcome::Removed { persisted: Ok(()) } => Ok(Json(serde_json::json!({ "removed": true })).into_response()),
+        RemoveOutcome::Removed { persisted: Err(_) } => Ok(not_saved()),
+        RemoveOutcome::Absent | RemoveOutcome::RevMismatch => Err(ApiError::new(StatusCode::NOT_FOUND, "no such subscription")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1396,6 +1634,21 @@ mod tests {
         assert!(check_origin(&h(&[("host", "laptop.example.ts.net"), ("origin", "https://laptop.example.ts.net")])).is_ok());
         assert!(check_origin(&h(&[("host", "laptop.example.ts.net"), ("origin", "https://evil.example")])).is_err());
         assert!(check_origin(&h(&[("host", "laptop.example.ts.net"), ("origin", "null")])).is_err());
+    }
+
+    #[test]
+    fn webpush_origin_check_requires_a_present_same_origin_and_json() {
+        let code = |pairs: &[(&'static str, &'static str)]| require_same_origin_json(&h(pairs), "/webpush/subscribe").map_err(|e| (e.0, e.1));
+        let host = ("host", "laptop.example.ts.net");
+        let origin = ("origin", "https://laptop.example.ts.net");
+        let json = ("content-type", "application/json; charset=utf-8");
+        assert!(code(&[host, origin, json]).is_ok());
+        assert_eq!(code(&[host, json]).unwrap_err(), (StatusCode::FORBIDDEN, "missing Origin".to_string()));
+        assert_eq!(code(&[host, ("origin", "https://evil.example"), json]).unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(code(&[host, origin, ("content-type", "text/plain")]).unwrap_err().0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(code(&[host, origin]).unwrap_err().0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let fwd = [("host", "127.0.0.1:8787"), ("x-forwarded-host", "laptop.example.ts.net"), origin, json];
+        assert!(code(&fwd).is_ok());
     }
 
     #[test]

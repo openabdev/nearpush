@@ -9,6 +9,7 @@ use nearpushd::config::{self, Config, Paths};
 use nearpushd::control::Control;
 use nearpushd::server::{self, AppState};
 use nearpushd::store::{Store, ensure_private_dir};
+use nearpushd::webpush;
 use tokio::signal::unix::{SignalKind, signal};
 
 /// Broadcast capacity per subscriber (clamped to buffer_size); slower subscribers
@@ -132,6 +133,24 @@ async fn run(args: Args) -> std::io::Result<()> {
         let c = state.control.read().unwrap_or_else(|p| p.into_inner());
         tracing::info!(paused = c.paused, states = ?c.states, source = ?c.source, "display controls");
     }
+    let state = if cfg.webpush.enabled {
+        // Fatal when it fails: a silently disabled feature would look like Apple failing.
+        let key = webpush::load_or_create_vapid(&paths.config_dir.join(webpush::VAPID_FILE))?;
+        let policy = webpush::EndpointPolicy::new(&cfg.webpush.endpoint_hosts);
+        let wp = webpush::WebPush::start(
+            cfg.webpush.clone(),
+            key,
+            &paths.state_dir,
+            state.control.clone(),
+            policy,
+            webpush::default_writer(),
+        )?;
+        tracing::info!(key_id = wp.key_id(), states = ?cfg.webpush.states, content = ?cfg.webpush.content, "web push enabled");
+        state.with_webpush(wp)
+    } else {
+        tracing::info!("web push disabled");
+        state
+    };
     if cfg.allowed_logins.is_empty() {
         // tailscaled may not be up yet at login, so keep trying in the background.
         let allowed = state.allowed_logins.clone();
