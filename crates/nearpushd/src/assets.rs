@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 
 pub const INDEX_HTML: &str = include_str!("../assets/index.html");
 pub const MANIFEST: &str = include_str!("../assets/manifest.webmanifest");
+/// The service worker that shows Web Push notifications.
+pub const SW_JS: &str = include_str!("../assets/sw.js");
 pub const ICON_180: &[u8] = include_bytes!("../assets/icon-180.png");
 pub const ICON_192: &[u8] = include_bytes!("../assets/icon-192.png");
 pub const ICON_512: &[u8] = include_bytes!("../assets/icon-512.png");
@@ -83,7 +85,7 @@ pub fn ui_version() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
         let mut h = Sha256::new();
-        for part in [INDEX_HTML.as_bytes(), MANIFEST.as_bytes(), ICON_180, ICON_192, ICON_512, KIRO_SVG] {
+        for part in [INDEX_HTML.as_bytes(), MANIFEST.as_bytes(), SW_JS.as_bytes(), ICON_180, ICON_192, ICON_512, KIRO_SVG] {
             h.update((part.len() as u64).to_le_bytes());
             h.update(part);
         }

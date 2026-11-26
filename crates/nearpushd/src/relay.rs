@@ -128,6 +128,9 @@ struct RelayEvent {
     id: u64,
     source: String,
     body: Value,
+    /// When the relay received the event (unix ms). Older relays may not send it.
+    #[serde(default)]
+    received_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -361,6 +364,19 @@ pub fn kiro_to_new_event(
     Ok(new)
 }
 
+/// Converts one relay event with the converter its body shape needs (a body with an
+/// `event` key is the Kiro adapter's), then records the relay's `received_ms` as the
+/// event's origin time, so the Web Push freshness bound applies to both shapes.
+fn convert(ev: RelayEvent, turns: &mut HashMap<String, u64>, now_ms: u64) -> Result<NewEvent, &'static str> {
+    let mut new = if ev.body.get("event").is_some() {
+        kiro_to_new_event(&ev.source, ev.id, ev.body, turns, now_ms)?
+    } else {
+        to_new_event(&ev.source, ev.id, ev.body, now_ms)?
+    };
+    new.origin_ms = ev.received_ms;
+    Ok(new)
+}
+
 /// Delay before retry `attempt` (1 for the first failure): 1 s, 2 s, 4 s and so on,
 /// capped at 60 s, plus up to half a step of jitter.
 pub fn backoff_delay(attempt: u32) -> Duration {
@@ -487,23 +503,19 @@ pub async fn run(state: AppState, cfg: RelayConfig, token: String, cursor_path: 
                 continue;
             }
             // A body with an `event` key is the Kiro adapter's shape; everything else is a push body.
-            let converted = if ev.body.get("event").is_some() {
-                kiro_to_new_event(&ev.source, ev.id, ev.body, &mut turns, now_ms())
-            } else {
-                to_new_event(&ev.source, ev.id, ev.body, now_ms())
-            };
-            match converted {
+            let id = ev.id;
+            match convert(ev, &mut turns, now_ms()) {
                 Ok(new) => match server::accept_event(&state, new).await {
-                    Ok(_) => seen.insert(ev.id),
+                    Ok(_) => seen.insert(id),
                     Err(e) => {
-                        tracing::error!(id = ev.id, status = e.0.as_u16(), "local store refused a relay event");
+                        tracing::error!(id, status = e.0.as_u16(), "local store refused a relay event");
                         failure = Some(RelayError::Store);
                         break;
                     }
                 },
-                Err(class) => tracing::warn!(id = ev.id, class, "skipped relay event"),
+                Err(class) => tracing::warn!(id, class, "skipped relay event"),
             }
-            done = ev.id;
+            done = id;
         }
 
         if done > cursor {
@@ -708,6 +720,24 @@ mod tests {
         assert_eq!(kiro_to_new_event("host-a", 17, body, &mut turns, NOW_MS).unwrap_err(), "invalid_event");
         let body = adapter("Turn_End", "fake-session-7", Some(TURN_END_3M), Some("x"));
         assert_eq!(kiro_to_new_event("host-a", 18, body, &mut turns, NOW_MS).unwrap_err(), "invalid_event");
+    }
+
+    #[test]
+    fn origin_ms_comes_from_received_ms_for_both_converters() {
+        let page: Page = serde_json::from_value(json!({"events": [
+            {"id": 1, "source": "kiro", "received_ms": 1_000, "body": {"title": "done", "state": "all_set"}},
+            {"id": 2, "source": "host-a", "received_ms": 2_000,
+             "body": adapter("turn_end", "fake-session-8", Some(TURN_END_3M), Some("Fake work is finished."))},
+            {"id": 3, "source": "kiro", "body": {"title": "older relay"}},
+        ]}))
+        .unwrap();
+        let mut turns = HashMap::new();
+        let got: Vec<Option<u64>> =
+            page.events.into_iter().map(|e| convert(e, &mut turns, NOW_MS).unwrap().origin_ms).collect();
+        assert_eq!(got, vec![Some(1_000), Some(2_000), None]);
+        // A body cannot set it: it is an unknown field to the push shape.
+        assert_eq!(to_new_event("kiro", 4, json!({"title": "t", "origin_ms": 5}), 1).unwrap_err(), "invalid_event");
+        assert_eq!(to_new_event("kiro", 4, json!({"title": "t"}), 1).unwrap().origin_ms, None);
     }
 
     #[test]

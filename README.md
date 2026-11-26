@@ -84,6 +84,8 @@ scp <build-host>:~/repo/nearpush/target/release/{nearpushd,nearpush} ~/.local/bi
 | `~/.local/state/nearpush/sessions.json` | per-session prompt history (capped) and summarized labels (0600) |
 | `~/.local/state/nearpush/hooks/*.json` | `nearpush hook` per-session state (0600) |
 | `~/.local/state/nearpush/control.json` | runtime pause and filter set through `POST /control` (0600) |
+| `~/.config/nearpush/webpush-vapid.pem` | Web Push VAPID private key (PKCS#8 PEM), created when `[webpush] enabled = true` (0600) |
+| `~/.local/state/nearpush/webpush.json` | Web Push subscriptions, at most 8 (0600) |
 | `~/Library/Logs/nearpush/nearpushd.log` | daemon log when started by the menu bar app (`--log-file`, 0600) |
 | `~/.config/nearpush/icons/<sender>.{svg,png}` | optional icon overrides |
 
@@ -117,6 +119,14 @@ enabled = true                   # false: rules verdict only, no provider calls
 provider = "kiro"                # "kiro" | "openrouter" | "typesafe"; menu bar app can change it live
 threshold = 0.5                  # openrouter/typesafe: noul at or above this is your_turn (0..=1)
 timeout_secs = 30                # provider's own limit (1..=30); the 15 s card hold is the binding limit
+
+[webpush]                        # Web Push to the home-screen app (and a paired Apple Watch)
+enabled = false                  # true: create the VAPID key and send pushes
+subject = "mailto:you@example.com"  # VAPID contact sent to Apple; required when enabled
+states = ["your_turn", "allow", "all_set"]  # subset of these three; "working" is rejected
+content = "state"                # "state" (default, title only) | opt-in: "summary" | "label" | "detail"
+ttl_secs = 300                   # 30..=3600; also the freshness bound for pushing an event
+endpoint_hosts = ["web.push.apple.com"]  # push services the daemon may post to
 ```
 
 **Display filter.** An event is shown when it is not muted (see pause below) and either
@@ -305,7 +315,7 @@ binary for the hand-written LaunchAgent below.
 4. `mv ~/Library/LaunchAgents/dev.nearpush.daemon.plist.bak-menubar ~/Library/LaunchAgents/dev.nearpush.daemon.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.nearpush.daemon.plist`
 5. `mv ~/.local/bin/nearpush.bak-menubar ~/.local/bin/nearpush`, in the same step as the daemon
    restore in step 4.
-6. Remove `[filter]`, `[hook]`, `[classifier]` and `public_url` from
+6. Remove `[filter]`, `[hook]`, `[classifier]`, `[webpush]` and `public_url` from
    `~/.config/nearpush/config.toml` if you added them; the old daemon refuses to start
    with unknown keys. The `classifier` key that `control.json` may hold is ignored by the
    old daemon, so that file needs no change.
@@ -524,8 +534,30 @@ otherwise (see above). Use `nearpush send --state allow` by hand or from another
   `.png`, then a built-in icon (`kiro`: the official logo from <https://kiro.dev/icon.svg>),
   then a generated tile with the sender's first letter. Only `[a-z0-9-]{1,32}` names
   resolve; anything else is 404.
-- `GET /`, `/manifest.webmanifest`, `/icon-*.png`, `/icons/*`: need an allowlisted
+- `GET /`, `/manifest.webmanifest`, `/icon-*.png`, `/icons/*`, `/sw.js`: need an allowlisted
   `Tailscale-User-Login` (or the local-testing flag).
+- `GET /webpush/key` (viewer): `{"enabled", "key", "key_id"}`, the VAPID public key for
+  `pushManager.subscribe`.
+- `POST /webpush/subscribe` and `POST /webpush/unsubscribe` (viewer, plus a present
+  same-origin `Origin` and `Content-Type: application/json`, 4 KiB): the page's
+  **Enable notifications** / **Turn off**. Subscribe takes
+  `{"subscription": <PushSubscription JSON>, "label"?: string}` and answers
+  `{"id", "created"}`; only endpoints on `endpoint_hosts` are accepted (400 otherwise),
+  and a ninth device gets 409. Unsubscribe takes `{"endpoint"}` and answers
+  `{"removed": bool}`.
+- `POST /webpush/test` (local, like `/status`): one test push to every subscription,
+  ignoring pause, filter and freshness. Answers
+  `{"results": [{"id", "label", "status", "class"}]}`.
+- `POST /webpush/remove` (local): `{"id"}` removes a subscription (404 if unknown). It
+  is for devices that are gone; a device that still has the page open re-subscribes on
+  its next load, so stop a phone in use with **Turn off** on it.
+- A 500 `{"error": "cannot save webpush.json", "applied": true}` from subscribe,
+  unsubscribe or remove means the change is live but not saved yet; the daemon retries
+  every 30 s and `/status` shows `webpush.dirty` until it succeeds. A removal lost to a
+  restart before that comes back: check `/status` and repeat the remove.
+- `/status` also has `webpush`: `enabled`, `key_id`, `dirty`, the `sent`, `failed` and
+  `dropped_*` counters, and `subscriptions` with each device's `id`, `label`, `login`,
+  `endpoint_host`, `created_ms`, `last_ok_ms` and `last_error_class` (no endpoint path, no keys).
 
 ## iPhone
 
@@ -547,8 +579,8 @@ offline (the drawer header shows the retry countdown).
 ### Updates and the iOS background limitation
 
 iOS suspends a web page as soon as it leaves the screen, and its WebSocket goes with it.
-There is no Web Push here, so **nothing arrives while the page is in the background or the
-phone is locked**; it is a display, not a notifier. When the page becomes visible again
+Without `[webpush]`, **nothing arrives while the page is in the background or the phone
+is locked**; it is a display, not a notifier (see Notifications below). When the page becomes visible again
 (`visibilitychange` / `pageshow`) it reconnects at once with `since=<last seen id>` from
 localStorage, so every event pushed in the meantime is replayed, as long as it is still
 in the daemon's buffer (`buffer_size`, default 500). While visible it reconnects with
@@ -557,3 +589,38 @@ exponential backoff (1 s doubling to 30 s) and treats 50 s of silence as a dead 
 The hello frame carries the UI version (crate version plus a hash of the embedded
 assets). When it differs from the version the page was loaded with, the page reloads
 itself, so installing a new `nearpushd` updates the phone with no action on it.
+
+### Notifications and Apple Watch (Web Push)
+
+With `[webpush] enabled = true` (and a `subject`), nearpushd sends `your_turn`, `allow`
+and `all_set` as Web Push notifications to the home-screen app. iOS mirrors them to a
+paired Apple Watch while the iPhone is locked. `working` and generic events never push.
+
+1. Set `[webpush]` in config.toml and restart nearpushd. It creates
+   `~/.config/nearpush/webpush-vapid.pem` on first start.
+2. On each iPhone, open nearpush **from the home screen** (Safari tabs cannot receive
+   Web Push; the drawer says so), open the drawer, type a device label and tap
+   **Enable notifications**, then allow notifications.
+3. Check with `curl -X POST -H "Authorization: Bearer $(cat ~/.config/nearpush/token)" http://127.0.0.1:8787/webpush/test`.
+
+Enable it on both the carried iPhone and the desk iPhone: each gets its own
+subscription and is delivered on its own, so the same notification may ring on both.
+
+What pushes follows the page: pause suppresses pushes, the display filter
+(`[filter] states` or the menu's *Show on iPhone*) also governs them (unchecking
+`all_set` stops both the card and the push), and any pause or filter change cancels
+pushes still queued. Events older than `ttl_secs` (for example a relay backlog after
+the lid was closed) show as cards but do not buzz the Watch, and a restart sends nothing.
+
+Titles are fixed per state: `✋ your turn`, `✅ all set`, `❓ allow?`. **Privacy:** the
+lock screen and the Watch are readable by anyone nearby. Under the default
+`content = "state"` the notification carries only that title and no task text. The
+opt-ins put text on them: `"summary"` the generated session summary (unsanitized; it
+can repeat prompt text) or the session tag, plus the project directory name;
+`"label"` may show the raw first prompt line; `"detail"` adds commands and file paths.
+Apple's push service sees the endpoint, the laptop's IP, the time and constant size of
+each push and the `subject`, but not the encrypted content. Logs never contain the
+endpoint path, keys, JWT, payload or any push service response body.
+
+To rotate the key, delete `webpush-vapid.pem`, restart, and tap **Enable notifications**
+on each device again.

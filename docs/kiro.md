@@ -18,6 +18,8 @@ flowchart LR
   end
   D -->|tailscale serve| T[HTTPS on tailnet]
   T -->|wss /ws| P[iPhone SE<br/>Safari page]
+  D -.->|Web Push, optional<br/>your_turn / allow / all_set| W[web.push.apple.com]
+  W -.-> I[iPhone home-screen app] -.->|mirror when locked| AW[Apple Watch]
 ```
 
 - **`nearpush hook`** runs on every Kiro hook event, reads the event JSON on stdin, turns it
@@ -157,4 +159,6 @@ sequenceDiagram
   the session you talk to notifies. `[hook] include_subagents = true` in config.toml
   turns the skip off. A missing `session.json` counts as a top-level session.
 - iOS suspends Safari in the background. Keep the page in front (Auto-Lock: Never, or
-  Guided Access) for live updates; missed events replay on return.
+  Guided Access) for live updates; missed events replay on return. With `[webpush]`
+  enabled, `your_turn`, `allow` and `all_set` also arrive as notifications (and on a
+  paired Apple Watch) while the page is in the background; see the README.
