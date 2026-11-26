@@ -941,9 +941,13 @@ person who needs Apple's reason can reproduce with `/webpush/test` and a debugge
 
 ### Q3: desk iPhone SE vs carried iPhone
 
-Still open; this revision does not decide it. The base design sets no default for the
-SE: it neither enrolls the SE nor blocks it. Nothing is pushed to any device until
-someone taps **Enable notifications** on it.
+**Decided by pahud: option B, both devices receive pushes.** The carried iPhone and the
+desk iPhone SE each tap **Enable notifications** and each get their own subscription.
+Each subscription is delivered independently, through its own upsert and lane, so a
+failure or delay on one device does not affect the other. The same notification may
+therefore ring on both devices; the design does not dedupe across devices, and pahud
+accepts that. Nothing is pushed to a device until someone taps **Enable notifications**
+on it.
 
 **Boundary, decided in this revision:** Q3 changes enrollment documentation only (the
 README's iPhone section). It adds no config key, no validation and no code under any
@@ -963,8 +967,8 @@ implementation, and the implementation can proceed before Q3 is decided.
 
 Untested facts that bear on the choice: whether iOS shows a banner for a push while the
 same web app is in the foreground on the SE, and whether that matters on an always-on
-desk display. The implementation plan below runs without this decision; only the README
-wording waits for it.
+desk display. With option B chosen, the README says to enable notifications on both
+phones.
 
 ### D2: default payload text (decided)
 
@@ -1289,3 +1293,4 @@ Opus findings are O-M1 and O-L1 to O-L3; sol findings are S1 to S5, in the order
 | M1 | `origin_ms` is set only in `to_new_event`, so Kiro adapter relay events (`kiro_to_new_event`) bypass the freshness bound (opus, MEDIUM, blocking) | Addressed. "Event origin time" now states that `relay::run` sets `new.origin_ms = ev.received_ms` after either converter, so the freshness check runs on every relay-sourced event. The unit test and the stale-relay integration test cover both body shapes. |
 | L1 | Reusing `check_origin` logs `rejected cross-origin websocket` for `/webpush/*` (opus, LOW) | Addressed. `require_same_origin_json` logs its own warn `rejected cross-origin webpush request` on an Origin mismatch. |
 | L2 | Local-testing callers must send `Origin` on subscribe and unsubscribe (opus, LOW) | Addressed. One sentence under the Origin check: the check is unconditional, so loopback callers send `Origin` and a matching `Host`; integration tests set both. |
+| Q3 | Q3 (desk SE) decision (pahud) | Decided: option B. Both the carried iPhone and the desk SE receive pushes; each subscription is delivered independently, the same notification may ring on both, and there is no cross-device dedupe (accepted). README wording only; no new config key or code. |
