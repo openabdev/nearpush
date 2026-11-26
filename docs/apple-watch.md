@@ -10,9 +10,11 @@ Setup steps below test the path by hand.
 
 ```mermaid
 flowchart LR
-  D[nearpush server] -->|Web Push, VAPID| A[Apple push service]
-  A --> I[iPhone home-screen web app]
-  I -->|mirrored while locked| W[Apple Watch]
+  H["nearpush hook or send"] -->|POST /push| D["nearpushd on laptop"]
+  D -->|Web Push, VAPID| A["Apple push service<br/>web.push.apple.com"]
+  A -->|alert| I["iPhone, locked<br/>home-screen web app"]
+  I -->|mirrors alert| W["Apple Watch"]
+  D -.->|"tailscale serve, tailnet only: Home Screen page"| I
 ```
 
 - The iPhone runs nearpush as a home-screen web app (added from Safari).
@@ -55,6 +57,70 @@ flowchart LR
 4. Apple's push service forwards the notification to the paired iPhone. When the phone is
    locked, the iPhone mirrors the notification to the Apple Watch.
 5. On 2026-11-25, Apple's push service returned HTTP 201 for each send in the spike.
+
+The diagrams below show the designed production path. The spike sends the same kind of push
+by hand (Setup, step 6).
+
+### Subscribe
+
+The Home Screen page subscribes once per load. It re-posts an existing subscription on each
+load.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as Home Screen page
+  participant S as Service worker
+  participant B as Safari push service
+  participant D as nearpushd
+  P->>D: GET /webpush/key
+  D-->>P: enabled and VAPID public key
+  P->>S: register /sw.js
+  P->>B: pushManager.subscribe (after Enable notifications)
+  B-->>P: endpoint on web.push.apple.com and keys
+  P->>D: POST /webpush/subscribe
+  D->>D: store subscription
+```
+
+### Send
+
+Only `your_turn`, `allow` and `all_set` can push. `working` is never pushed.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant H as nearpush hook or send
+  participant D as nearpushd
+  participant L as Lane for one subscription
+  participant A as Apple push service
+  H->>D: POST /push (event)
+  D->>D: state is your_turn, allow or all_set
+  D->>D: not paused, passes display filter, age within ttl_secs
+  D->>L: one job per subscription
+  L->>L: encrypt (aes128gcm) and sign (VAPID)
+  L->>A: POST to subscription endpoint
+  alt 201, 200 or 202
+    A-->>L: accepted
+  else 403
+    A-->>L: rejected, subscription kept
+  else 404 or 410
+    A-->>L: gone, subscription removed
+  end
+```
+
+### Which devices ring
+
+Each subscribed iPhone gets its own push. The Watch mirrors only the iPhone it is paired
+with. The desk iPhone SE has no Watch, so it shows a banner.
+
+```mermaid
+flowchart LR
+  E["your_turn event"] --> D["nearpushd"]
+  D -->|own push| A["carried iPhone"]
+  D -->|own push| B["desk iPhone SE"]
+  A -->|mirrors| W["Apple Watch paired to carried iPhone"]
+  B -->|banner, not yet tested| X["banner on desk iPhone"]
+```
 
 The spike used a separate tool, `tools/webpush-spike`. The production daemon was not
 changed.
@@ -226,8 +292,9 @@ Errors that the setup steps can cause:
 
 - **Declarative Web Push.** Whether the Declarative Web Push format supports a per-push icon
   or a custom summary is not verified.
-- **Desk SE.** Whether the iPhone SE on the desk receives pushes is undecided (spike
-  question Q3).
+- **Desk SE.** The design decides that the iPhone SE on the desk receives its own push
+  (spike question Q3, option B). Whether its banner shows over the desk display is not
+  tested.
 - **Design review.** The design in `.agents/tasks/apple-watch-webpush/design.md` has not
   passed council review. Treat it as a draft.
 - **Production integration.** `nearpushd` does not send Web Push yet. The spike server
