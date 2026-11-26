@@ -22,6 +22,8 @@ flowchart LR
   W -.-> I[iPhone home-screen app] -.->|mirror when locked| AW[Apple Watch]
 ```
 
+Web Push details, including the Apple Watch path, are in [apple-watch.md](apple-watch.md).
+
 - **`nearpush hook`** runs on every Kiro hook event, reads the event JSON on stdin, turns it
   into a card, posts it to nearpushd and exits. It always exits 0, prints nothing on
   stdout, gives the daemon under a second and stays quiet when the daemon is down, so it
@@ -102,6 +104,11 @@ sequenceDiagram
    this session, changed in the last 24 h). It never changes the verdict; nearpushd shows
    it only as a footer `N wf waiting` when the final verdict is `all set.`. Running counts
    are not shown.
+   Web Push does not send two `all_set` cards in a row for the same session. If the
+   session's previous stateful event in the buffer is also `all_set`, the new `all_set` is
+   stored and shown on the page but not pushed. Only the first `all_set` after a
+   `your_turn`, `allow` or `working` event is pushed. The state is kept in `events.jsonl`,
+   so it survives a nearpushd restart.
 4. **Reconnect**: the iPhone reconnects with `since=<last id>` and nearpushd replays what it
    missed; a small note appears if events fell out of the buffer.
 
