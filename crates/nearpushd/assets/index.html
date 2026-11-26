@@ -152,6 +152,12 @@
                          border-radius: 2px; background: var(--faint); }
   #drawer h2 { margin: 0; font-size: 17px; flex: 1; padding-top: 6px; }
   #conninfo { font-size: 12px; color: var(--dim); padding-top: 6px; text-align: right; }
+  #wp { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 var(--pad-r) 8px var(--pad-l);
+        font-size: 13px; color: var(--dim); flex: none; }
+  #wp[hidden], #wp [hidden] { display: none; }
+  #wp input { width: 7em; font: inherit; color: var(--fg); background: #1c1c1f; border: 1px solid #2a2a2e;
+              border-radius: 6px; padding: 4px 6px; }
+  #wp button { color: var(--fg); background: #2a2a2e; border-radius: 6px; padding: 5px 10px; }
   #list { list-style: none; margin: 0; padding: 0 0 8px; overflow-y: auto; -webkit-overflow-scrolling: touch;
           overscroll-behavior: contain; }
   #list li { display: flex; gap: 10px; align-items: center; padding: 10px var(--pad-r) 10px var(--pad-l);
@@ -205,6 +211,9 @@
 <div id="shade"></div>
 <section id="drawer" aria-label="Recent events">
   <header><span class="grab"></span><h2>Recent</h2><div id="conninfo"></div></header>
+  <div id="wp" hidden><span id="wptext"></span><input id="wplabel" maxlength="32" value="iPhone"
+    aria-label="Device label" hidden><button id="wpon" hidden>Enable notifications</button><button id="wpoff"
+    hidden>Turn off</button></div>
   <ul id="list"></ul>
 </section>
 <script>
@@ -918,9 +927,106 @@
   window.addEventListener('orientationchange', () => setTimeout(fit, 250));
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
 
+  // ---- web push -------------------------------------------------------------
+  // iOS offers Web Push only to the home-screen app. The daemon's VAPID key is
+  // compared with the subscription's before any re-POST, so an old-key subscription
+  // is never stored again.
+  const LS_WP_LABEL = 'nearpush.wpLabel';
+  const standalone = navigator.standalone === true ||
+    (!!window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  const swReady = 'serviceWorker' in navigator
+    ? navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => null) : Promise.resolve(null);
+  let wpKey = null;
+  function b64urlBytes(s) {
+    const b = s.replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(b + '='.repeat((4 - b.length % 4) % 4));
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+  }
+  function sameBytes(a, b) {
+    const x = new Uint8Array(a), y = new Uint8Array(b);
+    return x.length === y.length && x.every((v, i) => v === y[i]);
+  }
+  function wpLabel() {
+    let l = '';
+    try { l = localStorage.getItem(LS_WP_LABEL) || ''; } catch { /* storage disabled */ }
+    return l || 'iPhone';
+  }
+  function wpShow(state, text) {
+    $('wp').hidden = state === 'hidden';
+    $('wptext').textContent = text || '';
+    $('wpon').hidden = $('wplabel').hidden = state !== 'off';
+    $('wpoff').hidden = state !== 'on';
+  }
+  function wpPost(path, body) {
+    return fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      cache: 'no-store', credentials: 'same-origin',
+    }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }), () => ({ status: 0, body: {} }));
+  }
+  async function wpForget(sub) {
+    const endpoint = sub.endpoint;
+    try { await sub.unsubscribe(); } catch { /* already gone */ }
+    await wpPost('/webpush/unsubscribe', { endpoint });
+  }
+  async function wpInit() {
+    let info = null;
+    try {
+      const r = await fetch('/webpush/key', { cache: 'no-store', credentials: 'same-origin' });
+      info = r.ok ? await r.json() : null;
+    } catch { info = null; }
+    if (!info || !info.enabled || !info.key) return wpShow('hidden');
+    if (!standalone) return wpShow('hint', 'Add to Home Screen to get notifications');
+    const reg = await swReady;
+    if (!reg || !('PushManager' in window) || !('Notification' in window)) return wpShow('hidden');
+    wpKey = info.key;
+    if (Notification.permission === 'denied') return wpShow('blocked', 'notifications blocked in iOS Settings');
+    const sub = await reg.pushManager.getSubscription().catch(() => null);
+    if (!sub || Notification.permission !== 'granted') {
+      $('wplabel').value = wpLabel();
+      return wpShow('off');
+    }
+    const ask = sub.options && sub.options.applicationServerKey;
+    if (!ask) return wpShow('on', 'notifications on');
+    if (!sameBytes(ask, b64urlBytes(wpKey))) {
+      // The daemon's key was rotated: a new subscription needs a tap.
+      await wpForget(sub);
+      $('wplabel').value = wpLabel();
+      return wpShow('off');
+    }
+    const label = wpLabel();
+    await wpPost('/webpush/subscribe', { subscription: sub.toJSON(), label });
+    wpShow('on', `notifications on (${label})`);
+  }
+  $('wpon').addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    try {
+      const perm = await Notification.requestPermission();
+      if (perm === 'denied') return wpShow('blocked', 'notifications blocked in iOS Settings');
+      if (perm !== 'granted') return wpShow('off');
+      const reg = await swReady;
+      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64urlBytes(wpKey) });
+      const label = $('wplabel').value.trim().slice(0, 32) || 'iPhone';
+      try { localStorage.setItem(LS_WP_LABEL, label); } catch { /* storage disabled */ }
+      const r = await wpPost('/webpush/subscribe', { subscription: sub.toJSON(), label });
+      if (r.status === 200) wpShow('on', `notifications on (${label})`);
+      else if (r.status === 500 && r.body.applied) wpShow('on', `notifications on (${label}, not saved yet)`);
+      else { await wpForget(sub); wpShow('off', 'could not enable notifications'); }
+    } catch {
+      wpShow('off', 'could not enable notifications');
+    }
+  });
+  $('wpoff').addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    const reg = await swReady;
+    const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
+    if (sub) await wpForget(sub);
+    wpShow('off');
+  });
+
   render();
   connect();
   requestWake();
+  wpInit();
 })();
 </script>
 </body>
